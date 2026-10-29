@@ -27,6 +27,7 @@ from hyper_parallel.distributed.encoder_parallel.planning import (
     DecoderSequenceLayout,
     assign_lpt,
     build_destinations,
+    build_global_destinations,
     build_segments,
     required_omni_global_alignment,
 )
@@ -141,3 +142,33 @@ class TestEncoderPlanning(unittest.TestCase):
                             ("validate_metadata", True)):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unknown encoder_parallel keys"):
                 EncoderParallelConfig.from_mapping({name: value})
+        self.assertEqual(EncoderParallelConfig(group_scope="global").group_scope, "global")
+        with self.assertRaisesRegex(ValueError, "group_scope must be"):
+            EncoderParallelConfig(group_scope="other")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_global_destinations_keep_same_item_id_in_separate_dp_samples(self):
+        """Find decoder owners without mixing equal image IDs across DP.
+
+        Feature: Global Encoder-CP task keys.
+        Description: Use two decoder samples with different sequence lengths.
+        Expectation: Image zero routes only inside its original DP domain.
+        """
+        mesh = SimpleNamespace(cp_size=2, tp_size=2, cp_rank=0, tp_rank=0,
+                               sequence_parallel=True)
+        layouts = {
+            rank: DecoderSequenceLayout.build(
+                mesh_context=mesh, cp_local_length=8 if rank < 4 else 12,
+                cp_rank=(rank % 4) // 2, tp_rank=rank % 2,
+            ) for rank in range(8)
+        }
+        items = (
+            EncoderWorkItem(0, 0, 16, 4, 2, 8, 0, 16, {}, owner_dp_rank=0),
+            EncoderWorkItem(0, 0, 8, 2, 8, 7, 0, 8, {}, owner_dp_rank=1),
+        )
+        self.assertEqual([item.key for item in items], [(0, 0), (1, 0)])
+        self.assertEqual(build_global_destinations(items, layouts, 4),
+                         {(0, 0): (0, 1, 2), (1, 0): (5, 6)})
+        with self.assertRaisesRegex(ValueError, "no decoder DP owner"):
+            build_global_destinations((EncoderWorkItem(0, 0, 1, 1, 0, 1, 0, 1, {}, 2),), layouts, 4)

@@ -153,6 +153,9 @@ class VLMTrainer:
                 "micro_batch_size": int(config.training.micro_batch_size),
                 "compile_enabled": bool(config.compile.enabled),
                 "validate_placement": bool(getattr(config.model, "validate_placement", False)),
+                "record_image_identity": (
+                    getattr(getattr(config, "model_integration", None), "mode", None) == "runtime"
+                ),
             },
         )
         get_batch = config.dataloader.get_batch.build(
@@ -164,6 +167,7 @@ class VLMTrainer:
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
                 raise ValueError("encoder parallel requires OmniParallelBatch")
+            get_batch.source_only_pixel_values = True
             get_batch.runtime_input_adapter = EncoderParallelInputAdapter(
                 runtime=encoder_runtime,
                 inner=get_batch.runtime_input_adapter,
@@ -230,15 +234,40 @@ class VLMTrainer:
 
     def _forward_backward_micro_batches(
             self,
-            training_batches: list[Any],
+            data_iterator: Any,
             num_micro_steps: int,
     ) -> tuple[float, Dict[str, float]]:
-        """Run and aggregate the VLM forward-backward micro-steps."""
+        """Read and consume one device micro-batch at a time."""
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step, batch in enumerate(training_batches):
-            model_inputs, loss_inputs = batch
+        source_batches = None
+        prepared_batches = None
+        step_token_counts = None
+        if num_micro_steps > 1:
+            prepare_sources = getattr(self.base.get_batch, "prepare_step_sources", None)
+            if callable(prepare_sources):
+                source_batches, step_token_counts = prepare_sources(
+                    data_iterator, num_micro_steps, count_loss_token
+                )
+            else:
+                # Preserve the generic get_batch contract when it cannot
+                # prefetch CPU sources. Omni batches use the streaming path.
+                prepared_batches = [self.base.get_batch(data_iterator) for _ in range(num_micro_steps)]
+                step_token_counts = count_loss_token([loss for _, loss in prepared_batches])
+
+        for micro_step in range(num_micro_steps):
+            if source_batches is not None:
+                source = source_batches[micro_step]
+                model_inputs, loss_inputs = self.base.get_batch(data_iterator, prepared_cp_batch=source)
+                source_batches[micro_step] = None
+                del source
+            elif prepared_batches is not None:
+                model_inputs, loss_inputs = prepared_batches[micro_step]
+                prepared_batches[micro_step] = None
+            else:
+                model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+            self.base.on_micro_step_begin(model_inputs)
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
                 micro_step,
@@ -246,19 +275,12 @@ class VLMTrainer:
             )
             self.base.begin_fsdp_runtime_diagnostics(micro_step)
             self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
+            self.base.step_token_counts = step_token_counts or self.base.current_token_counts
             loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
-
-            # Release each device batch as soon as its backward pass completes;
-            # prefetching all micro-batches must not pin them until step end.
-            training_batches[micro_step] = None
-
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
+            del model_inputs, loss_inputs, loss, loss_dict
 
         return total_loss, total_loss_dict
 
@@ -272,20 +294,13 @@ class VLMTrainer:
             Aggregated loss and gradient norm.
         """
         memory_profiler.step()
-        first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
-
-        self.on_step_begin(
-            micro_batches=[model_inputs for model_inputs, _ in training_batches]
-        )
+        self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss, total_loss_dict = self._forward_backward_micro_batches(
-            training_batches,
+            data_iterator,
             num_micro_steps,
         )
 

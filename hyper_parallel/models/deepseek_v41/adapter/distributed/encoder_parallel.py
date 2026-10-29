@@ -21,10 +21,13 @@ from typing import Any, Mapping, Sequence
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
+from torch.utils.checkpoint import checkpoint  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.distributed.context_parallel import ulysses_head_to_seq, ulysses_seq_to_head
 from hyper_parallel.distributed.encoder_parallel.attention import (
+    EncoderAttentionContext,
+    activate_encoder_attention,
     current_encoder_attention_context,
 )
 from hyper_parallel.distributed.encoder_parallel.contracts import (
@@ -44,6 +47,16 @@ _IMAGE_FIELDS = (
     "pixel_values", "image_patch_offsets", "image_vit_grid_hw", "image_llm_grid_hw",
     "image_batch_indices", "image_token_starts",
 )
+_VISION_CHECKPOINT_GROUP_SIZE = 4
+
+
+def _run_vision_block_group(hidden: torch.Tensor, cosine: torch.Tensor, sine: torch.Tensor,
+                            blocks: tuple[nn.Module, ...], context: EncoderAttentionContext) -> torch.Tensor:
+    """Re-enter the encoder attention scope during checkpoint recomputation."""
+    with activate_encoder_attention(context):
+        for block in blocks:
+            hidden = block(hidden, cosine, sine)
+    return hidden
 
 
 def _bundle_shapes_valid(pixels: torch.Tensor, offsets: torch.Tensor,
@@ -189,15 +202,31 @@ class DeepseekV41VisionBridge:
         """
         return build_deepseek_v41_work_items(batch)
 
+    def parse_images_metadata(self, batch: Mapping[str, Any]) -> tuple[EncoderWorkItem, ...]:
+        """Validate image descriptors without allocating the full patch payload.
+
+        Args:
+            batch: Decoder-local fields with image metadata but no pixel tensor.
+        """
+        offsets = batch["image_patch_offsets"]
+        patch_count = max(0, int(offsets.reshape(-1)[-1])) if torch.is_tensor(offsets) and offsets.numel() else 0
+        patch_size = self.vision.patch_size
+        placeholder = torch.empty((patch_count, 3, patch_size, patch_size), device="meta")
+        return build_deepseek_v41_work_items({**batch, "pixel_values": placeholder})
+
     def _pack_local_inputs(self, batch: Mapping[str, Any], segments: Sequence[EncoderSegment]
                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pack image shards and identity RoPE for padded positions."""
         vision = self.vision
         pixels = batch.get("pixel_values")
-        prototype = pixels if pixels is not None else vision.patch_embed.proj.weight
+        routed = batch.get("local_patches")
+        if routed is not None and (not torch.is_tensor(routed) or routed.ndim != 4):
+            raise ValueError("local_patches must be a four-dimensional tensor")
+        prototype = routed if routed is not None else pixels if pixels is not None else vision.patch_embed.proj.weight
         patch_parts = []
         cosine_parts = []
         sine_parts = []
+        cursor = 0
         for segment in segments:
             if segment.is_dummy:
                 local = prototype.new_zeros((segment.local_padded_length, 3,
@@ -206,16 +235,21 @@ class DeepseekV41VisionBridge:
                                     dtype=torch.float32, device=local.device)
                 sine = torch.zeros_like(cosine)
             else:
-                if pixels is None:
-                    raise ValueError("real image segment requires pixel_values")
                 item = segment.item
-                full = pixels[item.payload_start:item.payload_stop]
-                local = full[segment.local_start:segment.local_start + segment.local_valid_length]
+                if routed is not None:
+                    stop = cursor + segment.local_valid_length
+                    local = routed[cursor:stop]
+                    cursor = stop
+                else:
+                    if pixels is None:
+                        raise ValueError("real image segment requires pixel_values")
+                    full = pixels[item.payload_start:item.payload_stop]
+                    local = full[segment.local_start:segment.local_start + segment.local_valid_length]
                 pad_count = segment.local_padded_length - segment.local_valid_length
                 if pad_count:
-                    local = torch.cat((local, full.new_zeros((pad_count, *full.shape[1:]))), dim=0)
+                    local = torch.cat((local, prototype.new_zeros((pad_count, *prototype.shape[1:]))), dim=0)
                 full_cosine, full_sine = _vision_cos_sin(*item.metadata["vit_hw"], vision.rope_dim,
-                                                         vision.rope_theta, pixels.device)
+                                                         vision.rope_theta, prototype.device)
                 cosine = full_cosine[segment.local_start:segment.local_start + segment.local_valid_length]
                 sine = full_sine[segment.local_start:segment.local_start + segment.local_valid_length]
                 if pad_count:
@@ -226,13 +260,15 @@ class DeepseekV41VisionBridge:
             patch_parts.append(local)
             cosine_parts.append(cosine)
             sine_parts.append(sine)
+        if routed is not None and cursor != routed.shape[0]:
+            raise ValueError("routed patch count does not match local segments")
         return torch.cat(patch_parts), torch.cat(cosine_parts), torch.cat(sine_parts)
 
     def encode_local(self, batch: Mapping[str, Any], segments: Sequence[EncoderSegment]) -> torch.Tensor:
         """Run native patch embedding, ViT blocks and final norm on packed shards.
 
         Args:
-            batch: Device batch containing complete image patch tensors.
+            batch: Complete local image tensors or routed local patch rows.
             segments: This Encoder-CP rank's padded image shards.
 
         Returns:
@@ -242,8 +278,16 @@ class DeepseekV41VisionBridge:
         if patches.shape[0] != sum(segment.local_padded_length for segment in segments):
             raise ValueError("packed patch count does not match segment table")
         hidden = self.vision.patch_embed(patches)
-        for block in self.vision.blocks:
-            hidden = block(hidden, cosine, sine)
+        context = current_encoder_attention_context()
+        if self.vision.training and torch.is_grad_enabled() and context is not None:
+            blocks = tuple(self.vision.blocks)
+            for start in range(0, len(blocks), _VISION_CHECKPOINT_GROUP_SIZE):
+                group = blocks[start:start + _VISION_CHECKPOINT_GROUP_SIZE]
+                hidden = checkpoint(_run_vision_block_group, hidden, cosine, sine, group, context,
+                                    use_reentrant=False)
+        else:
+            for block in self.vision.blocks:
+                hidden = block(hidden, cosine, sine)
         return self.vision.norm(hidden)
 
     def project(self, hidden: torch.Tensor, item: EncoderWorkItem | None) -> torch.Tensor:

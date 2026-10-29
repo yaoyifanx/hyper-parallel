@@ -19,7 +19,8 @@ from typing import Any
 
 
 def derive_reshaped_submesh(root_mesh: Any, *, source_dims: tuple[str, ...],
-                           target_sizes: tuple[int, ...], target_names: tuple[str, ...]) -> Any:
+                           target_sizes: tuple[int, ...], target_names: tuple[str, ...],
+                           parent_name: str = "encoder_parent") -> Any:
     """Reshape a named submesh while preserving its physical rank order.
 
     Args:
@@ -27,12 +28,13 @@ def derive_reshaped_submesh(root_mesh: Any, *, source_dims: tuple[str, ...],
         source_dims: Decoder axes forming one visual parent group.
         target_sizes: Encoder-DP and Encoder-CP degrees.
         target_names: Names assigned to the derived axes.
+        parent_name: Name of the temporary flattened parent mesh.
     """
     source = root_mesh[source_dims]
     if math.prod(target_sizes) != math.prod(source.mesh_shape) or len(target_sizes) != len(target_names):
         raise ValueError("encoder mesh shape does not match decoder parent")
-    flat = source.flatten("encoder_parent")
-    return flat._unflatten("encoder_parent", target_sizes, target_names)  # pylint: disable=protected-access
+    flat = source.flatten(parent_name)
+    return flat._unflatten(parent_name, target_sizes, target_names)  # pylint: disable=protected-access
 
 
 def encoder_coordinates(parent_rank: int, encoder_cp_size: int) -> tuple[int, int]:

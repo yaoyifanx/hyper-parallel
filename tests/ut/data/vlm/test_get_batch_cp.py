@@ -14,20 +14,20 @@
 # ============================================================================
 """Context-parallel sharding in the merged Omni batch path.
 
-The Omni collator pads token fields to ``tp_size * cp_size`` before
-``OmniParallelBatch`` builds a :class:`CPBatchSharder` configured with
-``OMNI_CP_TOKEN_FIELDS``. The sharder selects contiguous token windows and
-preserves global packed boundaries and complete modality metadata. These tests
-exercise the real collator and sharder on CPU without a process group.
+The Omni collator pads token fields to ``tp_size * cp_size``. The
+``OmniParallelBatch`` sharder then pads to the attention/SP alignment before
+selecting contiguous CP windows. It preserves packed boundaries and complete
+modality metadata. These tests exercise both steps on CPU without a process group.
 """
 
 import unittest
+from math import lcm
 from types import SimpleNamespace
 
 import torch
 
 from hyper_parallel.data.batching.build_collate_fn import build_omni_collate_fn
-from hyper_parallel.data.constants import OMNI_CP_TOKEN_FIELDS
+from hyper_parallel.data.constants import OMNI_CP_PAD_VALUES, OMNI_CP_TOKEN_FIELDS
 from hyper_parallel.data.parallel import CPBatchSharder, DataLoaderParallelContext
 from tests.common.mark_utils import arg_mark
 
@@ -53,7 +53,9 @@ def _make_batch(seq_len: int = 8, pad_tail: int = 2) -> dict[str, torch.Tensor]:
 def _build_sharder(cp_size: int, cp_rank: int = 0, tp_size: int = 1) -> CPBatchSharder:
     """Build the sharder exactly as OmniParallelBatch configures it."""
     context = DataLoaderParallelContext(cp_world_size=cp_size, cp_rank=cp_rank, tp_world_size=tp_size)
-    return CPBatchSharder(context, token_fields=OMNI_CP_TOKEN_FIELDS)
+    token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
+    return CPBatchSharder(context, token_pad_values=token_pad_values,
+                          required_global_alignment=lcm(2 * cp_size, cp_size * tp_size))
 
 
 def _collate_batch(batch: dict[str, torch.Tensor], cp_size: int, tp_size: int = 1) -> dict[str, torch.Tensor]:
@@ -147,7 +149,7 @@ class TestOmniBatchCpSharding(unittest.TestCase):
         """Feature: CP sequence alignment.
 
         Description: Shard eight tokens across three CP ranks.
-        Expectation: Collate pads to nine tokens, preserving the real boundary at eight.
+        Expectation: Collate pads to nine, then CP padding extends to twelve.
         """
         seq_len = 8
         batch = _make_batch(seq_len=seq_len, pad_tail=0)
@@ -155,14 +157,14 @@ class TestOmniBatchCpSharding(unittest.TestCase):
         local_batches = [_build_sharder(3, cp_rank).shard(aligned) for cp_rank in range(3)]
 
         for local in local_batches:
-            self.assertEqual(tuple(local["input_ids"].shape), (1, 3))
-            self.assertEqual(local["cu_seq_lens"].tolist(), [0, 8, 9])
+            self.assertEqual(tuple(local["input_ids"].shape), (1, 4))
+            self.assertEqual(local["cu_seq_lens"].tolist(), [0, 8, 9, 12])
             self.assertEqual(local["cu_seq_lens"].dtype, torch.int32)
             torch.testing.assert_close(local["pixel_values"], batch["pixel_values"])
             torch.testing.assert_close(local["image_grid_thw"], batch["image_grid_thw"])
         for field in OMNI_CP_TOKEN_FIELDS.intersection(batch):
             reconstructed = torch.cat([local[field] for local in local_batches], dim=1)
-            torch.testing.assert_close(reconstructed, aligned[field])
+            torch.testing.assert_close(reconstructed[:, :aligned[field].shape[1]], aligned[field])
             torch.testing.assert_close(reconstructed[:, :seq_len], batch[field])
         for field, pad_value in (("input_ids", 0), ("labels", -100), ("attention_mask", 0),
                                  ("loss_mask", 0), ("mm_token_type_ids", -1)):
@@ -172,13 +174,14 @@ class TestOmniBatchCpSharding(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_cp_rejects_batches_not_aligned_by_collate(self) -> None:
-        """The sharder rejects unaligned tokens instead of changing global boundaries."""
+    def test_cp_pads_batches_not_aligned_by_collate(self) -> None:
+        """The sharder adds an ignored tail while preserving real boundaries."""
         batch = _make_batch(seq_len=11)
-        for cp_size, tp_size in ((1, 4), (2, 4), (3, 1)):
+        for cp_size, tp_size, global_length in ((1, 4, 12), (2, 4, 16), (3, 1, 12)):
             with self.subTest(cp_size=cp_size, tp_size=tp_size):
-                with self.assertRaisesRegex(ValueError, "align token fields in collate_fn"):
-                    _build_sharder(cp_size, tp_size=tp_size).shard(batch)
+                sharded = _build_sharder(cp_size, tp_size=tp_size).shard(batch)
+                self.assertEqual(sharded["input_ids"].shape[1], global_length // cp_size)
+                self.assertEqual(sharded["cu_seq_lens"].tolist(), [0, 11, global_length])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

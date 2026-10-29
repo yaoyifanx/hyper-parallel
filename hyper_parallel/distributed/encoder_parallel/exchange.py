@@ -35,6 +35,7 @@ class FeatureExchangeMode(Enum):
     TP_VARIABLE_ALL_GATHER = "tp_variable_all_gather"
     TP_VARIABLE_A2A = "tp_variable_a2a"
     PARENT_VARIABLE_A2A = "parent_variable_a2a"
+    GLOBAL_VARIABLE_A2A = "global_variable_a2a"
 
 
 def select_feature_exchange(mesh_context: Any) -> FeatureExchangeMode:
@@ -88,10 +89,10 @@ def _route_tp_all_gather(*, local_by_id: Mapping[int, torch.Tensor],
 
 
 def _route_variable_a2a(*, mode: FeatureExchangeMode,
-                        local_by_id: Mapping[int, torch.Tensor],
+                        local_by_id: Mapping[Any, torch.Tensor],
                         source_records: Mapping[int, tuple[EncoderWorkItem, ...]],
                         prototype: torch.Tensor, parent_rank: int,
-                        destinations: Mapping[int, tuple[int, ...]],
+                        destinations: Mapping[Any, tuple[int, ...]],
                         encoder_cp_size: int, exchange_mesh: Any
                         ) -> tuple[torch.Tensor, tuple[EncoderWorkItem, ...]]:
     """Send each full record only to its exact decoder token owners."""
@@ -102,10 +103,11 @@ def _route_variable_a2a(*, mode: FeatureExchangeMode,
     width = int(prototype.shape[-1])
     send_chunks = []
     input_splits = []
+    key = (lambda item: item.key) if mode is FeatureExchangeMode.GLOBAL_VARIABLE_A2A else (lambda item: item.item_id)
     for destination_rank in range(group_size):
         items = [item for item in source_records.get(parent_rank, ())
-                 if destination_rank in destinations[item.item_id]]
-        chunk = cat_or_empty([local_by_id[item.item_id] for item in items],
+                 if destination_rank in destinations[key(item)]]
+        chunk = cat_or_empty([local_by_id[key(item)] for item in items],
                              anchor=prototype, feature_width=width)
         send_chunks.append(chunk)
         input_splits.append(chunk.shape[0])
@@ -114,7 +116,7 @@ def _route_variable_a2a(*, mode: FeatureExchangeMode,
     received_items = []
     for source_rank in range(group_size):
         items = [item for item in source_records.get(source_rank, ())
-                 if local_rank in destinations[item.item_id]]
+                 if local_rank in destinations[key(item)]]
         output_splits.append(sum(item.output_rows for item in items))
         received_items.extend(items)
     rows = differentiable_all_to_all_single(packed, input_splits=input_splits,
@@ -123,12 +125,13 @@ def _route_variable_a2a(*, mode: FeatureExchangeMode,
 
 
 def route_features(*, mode: FeatureExchangeMode, producer_records: Sequence[EncoderFeature],
-                   prototype: torch.Tensor, parent_rank: int, destinations: Mapping[int, tuple[int, ...]],
+                   prototype: torch.Tensor, parent_rank: int, destinations: Mapping[Any, tuple[int, ...]],
                    buckets: Sequence[Sequence[EncoderWorkItem]], encoder_cp_size: int,
                    exchange_mesh: Any) -> tuple[torch.Tensor, tuple[EncoderWorkItem, ...]]:
     """Exchange full feature records using a deterministic plan shared by all ranks."""
     width = int(prototype.shape[-1])
-    local_by_id = {item.item_id: feature for item, feature in producer_records}
+    global_scope = mode is FeatureExchangeMode.GLOBAL_VARIABLE_A2A
+    local_by_id = {(item.key if global_scope else item.item_id): feature for item, feature in producer_records}
     source_records = _ordered_source_records(buckets, encoder_cp_size)
     if mode is FeatureExchangeMode.LOCAL:
         received_items = tuple(item for item, _ in producer_records)
@@ -139,7 +142,8 @@ def route_features(*, mode: FeatureExchangeMode, producer_records: Sequence[Enco
         return _route_tp_all_gather(local_by_id=local_by_id, source_records=source_records,
                                     prototype=prototype, parent_rank=parent_rank,
                                     exchange_mesh=exchange_mesh)
-    if mode in (FeatureExchangeMode.TP_VARIABLE_A2A, FeatureExchangeMode.PARENT_VARIABLE_A2A):
+    if mode in (FeatureExchangeMode.TP_VARIABLE_A2A, FeatureExchangeMode.PARENT_VARIABLE_A2A,
+                FeatureExchangeMode.GLOBAL_VARIABLE_A2A):
         return _route_variable_a2a(
             mode=mode, local_by_id=local_by_id, source_records=source_records,
             prototype=prototype, parent_rank=parent_rank, destinations=destinations,

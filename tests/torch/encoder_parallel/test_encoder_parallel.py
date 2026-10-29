@@ -44,6 +44,83 @@ def test_e0_runtime():
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_global_runtime_dp2_cp2_tp2_ecp8():
+    """Feature: Global ECP8 across two decoder samples.
+
+    Description: Route two DP images through one shared ViT group.
+    Expectation: Features and gradients agree with each sample reference.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_global_runtime_dp2_cp2_tp2_ecp8", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_global_runtime_dp2_cp2_tp2_ecp4():
+    """Feature: Global ECP4 work buckets.
+
+    Description: Route two images through separate ViT buckets.
+    Expectation: Each bucket returns its own sample's feature and gradient.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_global_runtime_dp2_cp2_tp2_ecp4", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_global_runtime_ecp4_text_only_dp():
+    """Feature: Text-only decoder DP in global ECP4.
+
+    Description: Keep one work bucket empty while another DP has an image.
+    Expectation: All ranks finish forward and backward without a hang.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_global_runtime_ecp4_text_only_dp", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_sample_runtime_source_only_pixels_with_checkpoint():
+    """Feature: Source-only pixels with sample-scoped ECP.
+
+    Description: Route each sample's pixels and checkpoint four ViT blocks.
+    Expectation: Features and gradients agree with the local reference.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_sample_runtime_source_only_pixels_with_checkpoint", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_sample_runtime_text_only_dp():
+    """Feature: Text-only sample with source-only patch transport.
+
+    Description: Run a sample-scoped ViT group with no local image.
+    Expectation: All ranks complete the collective sequence.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_sample_runtime_text_only_dp", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_global_preflight_error_all_ranks():
+    """Feature: Global preflight error propagation.
+
+    Description: Give one decoder replica malformed image metadata.
+    Expectation: Every rank raises the same error instead of hanging.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_global_preflight_error_all_ranks", num_proc=8)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_omni_prefetch_error_all_ranks():
+    """Feature: CPU batch prefetch error propagation.
+
+    Description: Give a TP source batch with missing labels.
+    Expectation: Both TP ranks raise the same error before forward.
+    """
+    torchrun_case(str(_HERE / "_test_global_runtime.py"),
+                  "test_omni_prefetch_error_all_ranks", num_proc=2)
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_tp_gather():
     """Feature: CP1/NOSP TP variable gather.
 

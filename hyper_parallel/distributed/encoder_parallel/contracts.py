@@ -36,6 +36,12 @@ class EncoderWorkItem:
     payload_start: int
     payload_stop: int
     metadata: Mapping[str, Any]
+    owner_dp_rank: int = 0
+
+    @property
+    def key(self) -> tuple[int, int]:
+        """Identify an image across decoder DP samples."""
+        return self.owner_dp_rank, self.item_id
 
 
 @dataclass(frozen=True)

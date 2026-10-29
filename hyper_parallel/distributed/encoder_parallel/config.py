@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,7 @@ class EncoderParallelConfig:
 
     enabled: bool = False
     encoder_cp_size: int = 1
+    group_scope: Literal["sample", "global"] = "sample"
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -36,6 +37,8 @@ class EncoderParallelConfig:
                 "accelerator.encoder_parallel.encoder_cp_size "
                 f"must be a positive integer, got {self.encoder_cp_size!r}"
             )
+        if self.group_scope not in ("sample", "global"):
+            raise ValueError("accelerator.encoder_parallel.group_scope must be 'sample' or 'global'")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "EncoderParallelConfig":

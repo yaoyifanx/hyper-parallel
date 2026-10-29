@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from hyper_parallel.data.batching.runtime_input import RuntimeInputAdapter, RuntimeInputContext
-from hyper_parallel.distributed.encoder_parallel.runtime import EncoderParallelRuntime
+from hyper_parallel.distributed.encoder_parallel.runtime import EncoderParallelPlan, EncoderParallelRuntime
 
 
 class EncoderParallelInputAdapter(RuntimeInputAdapter):
@@ -43,12 +43,36 @@ class EncoderParallelInputAdapter(RuntimeInputAdapter):
             self, *, batch: Mapping[str, Any], context: RuntimeInputContext,
     ) -> Mapping[str, Any]:
         """Validate locally, build other inputs, then agree on the visual plan."""
-        prepared = self.runtime.preflight_batch(batch)
-        generated = {} if self.inner is None else self.inner.build_runtime_inputs(batch=batch, context=context)
+        if getattr(getattr(self.runtime, "config", None), "group_scope", "sample") == "global":
+            prepared = None
+            error = None
+            try:
+                prepared = self.runtime.preflight_batch(batch)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                error = exc
+            self.runtime.agree_or_raise("preflight", error)
+            generated = None
+            error = None
+            try:
+                generated = {} if self.inner is None else self.inner.build_runtime_inputs(batch=batch, context=context)
+                if not isinstance(generated, Mapping):
+                    raise TypeError("RuntimeInputAdapter.build_runtime_inputs must return a mapping")
+                if "encoder_parallel_plan" in batch or "encoder_parallel_plan" in generated \
+                        or set(batch).intersection(generated):
+                    raise ValueError("runtime inputs cannot replace Omni model inputs")
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                error = exc
+            self.runtime.agree_or_raise("inner adapter", error)
+        else:
+            prepared = self.runtime.preflight_batch(batch)
+            generated = {} if self.inner is None else self.inner.build_runtime_inputs(batch=batch, context=context)
         if not isinstance(generated, Mapping):
             raise TypeError("RuntimeInputAdapter.build_runtime_inputs must return a mapping")
         inputs = dict(generated)
         if "encoder_parallel_plan" in batch or "encoder_parallel_plan" in inputs or set(batch).intersection(inputs):
             raise ValueError("runtime inputs cannot replace Omni model inputs")
-        inputs["encoder_parallel_plan"] = self.runtime.finalize_plan(*prepared)
+        plan = self.runtime.finalize_plan(*prepared)
+        if isinstance(plan, EncoderParallelPlan):
+            plan.prepare_patches(batch)
+        inputs["encoder_parallel_plan"] = plan
         return inputs

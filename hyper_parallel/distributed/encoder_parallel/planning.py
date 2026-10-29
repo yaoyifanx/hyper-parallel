@@ -125,7 +125,8 @@ def assign_lpt(items: Sequence[EncoderWorkItem], encoder_dp_size: int,
         raise ValueError("encoder DP and CP sizes must be positive")
     buckets: list[list[EncoderWorkItem]] = [[] for _ in range(encoder_dp_size)]
     loads = [0] * encoder_dp_size
-    for item in sorted(items, key=lambda value: (-value.sequence_length ** 2, value.batch_index, value.item_id)):
+    for item in sorted(items, key=lambda value: (-value.sequence_length ** 2, value.owner_dp_rank,
+                                                 value.batch_index, value.item_id)):
         bucket = min(range(encoder_dp_size), key=lambda rank: (loads[rank], rank))
         buckets[bucket].append(item)
         loads[bucket] += item.sequence_length ** 2 // encoder_cp_size
@@ -184,4 +185,33 @@ def build_destinations(items: Sequence[EncoderWorkItem], layouts: Mapping[int, D
         if not owners:
             raise ValueError(f"image span has no decoder token owner; item_id={item.item_id}")
         result[item.item_id] = owners
+    return result
+
+
+def build_global_destinations(
+        items: Sequence[EncoderWorkItem], layouts: Mapping[int, DecoderSequenceLayout],
+        decoder_parent_size: int) -> dict[tuple[int, int], tuple[int, ...]]:
+    """Reuse sample-local destination planning for each decoder DP owner.
+
+    Args:
+        items: Images from all decoder DP samples.
+        layouts: Decoder token layouts indexed by arena-local rank.
+        decoder_parent_size: Number of CP/TP ranks per decoder sample.
+    """
+    if decoder_parent_size < 1:
+        raise ValueError("decoder_parent_size must be positive")
+    result = {}
+    owner_ranks = {rank // decoder_parent_size for rank in layouts}
+    for owner in sorted(owner_ranks):
+        owned_items = [item for item in items if item.owner_dp_rank == owner]
+        local_layouts = {rank % decoder_parent_size: layout for rank, layout in layouts.items()
+                         if rank // decoder_parent_size == owner}
+        if len(local_layouts) != decoder_parent_size:
+            raise ValueError(f"decoder owner {owner} has an incomplete CP/TP layout")
+        local_destinations = build_destinations(owned_items, local_layouts)
+        result.update({(owner, item_id): tuple(owner * decoder_parent_size + rank for rank in ranks)
+                       for item_id, ranks in local_destinations.items()})
+    unknown = {item.owner_dp_rank for item in items} - owner_ranks
+    if unknown:
+        raise ValueError(f"image has no decoder DP owner: {sorted(unknown)}")
     return result

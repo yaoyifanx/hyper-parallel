@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from math import lcm
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.data.batching.runtime_input import (
     AttentionRuntime,
@@ -29,6 +31,7 @@ from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,
 )
 from hyper_parallel.data.constants import (
+    OMNI_CP_PAD_VALUES,
     OMNI_CP_TOKEN_FIELDS,
     OMNI_INTERNAL_FIELDS,
     OMNI_LOSS_INPUT_FIELDS,
@@ -45,7 +48,7 @@ logger = get_dataset_logger(__name__)
 
 
 class OmniParallelBatch:
-    """Validate collate-aligned Omni batches, shard over CP, and broadcast over TP."""
+    """Shard Omni token fields over CP and route modality fields over TP."""
 
     def __init__(
             self,
@@ -65,9 +68,6 @@ class OmniParallelBatch:
             runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
         """
-        # if encoder_dp:
-        #     raise NotImplementedError("OmniParallelBatch encoder_dp image-bucket distribution is not implemented")
-
         if runtime_input_adapter is not None and not isinstance(runtime_input_adapter, RuntimeInputAdapter):
             raise TypeError("OmniParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
 
@@ -88,37 +88,117 @@ class OmniParallelBatch:
         self.device = device
         self.sequence_parallel = bool(mesh_context.sequence_parallel)
         self.runtime_input_adapter = runtime_input_adapter
-        self.cp_sharder = CPBatchSharder(self.parallel_context, token_fields=OMNI_CP_TOKEN_FIELDS)
+        self.source_only_pixel_values = False
+        token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
+        cp_size = int(mesh_context.cp_size)
+        tp_parts = int(mesh_context.tp_size) if mesh_context.sequence_parallel else 1
+        alignment = lcm(2 * cp_size, cp_size * tp_parts)
+        self.cp_sharder = CPBatchSharder(
+            self.parallel_context, token_pad_values=token_pad_values,
+            required_global_alignment=alignment,
+        )
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
         self._batch_index = 0
+
+    def prepare_step_sources(
+            self,
+            data_iterator: Any,
+            num_micro_steps: int,
+            count_tokens: Callable[[dict[str, Any]], dict[str, torch.Tensor]],
+    ) -> tuple[list[Mapping[str, Any] | None], dict[str, torch.Tensor]]:
+        """Read CPU source batches and count CP-local step tokens exactly.
+
+        Keeping the source batches on CPU allows the training loop to create and
+        release one device micro-batch at a time. TP peers receive only the
+        small token-count dictionary here; regular batch transport remains in
+        :meth:`__call__`.
+
+        Args:
+            data_iterator: Source batches read on TP rank zero.
+            num_micro_steps: Number of micro-batches in this optimizer step.
+            count_tokens: Trainer callback counting valid tokens in loss inputs.
+
+        Returns:
+            CP-local CPU batches for this TP source and exact local step counts.
+        """
+        sources: list[Mapping[str, Any] | None] = []
+        counts: dict[str, int] | None = None
+        error: str | None = None
+        if self.parallel_context.build_on_rank():
+            counts = {}
+            try:
+                for _ in range(num_micro_steps):
+                    source = next(data_iterator)
+                    if not isinstance(source, Mapping):
+                        raise TypeError("Omni DataLoader must yield a mapping batch")
+                    local_batch = self.cp_sharder.shard(self._normalize_source_batch(source))
+                    _, loss_inputs = self._split_model_and_loss_inputs(local_batch)
+                    for name, value in count_tokens(loss_inputs).items():
+                        counts[name] = counts.get(name, 0) + int(value.item())
+                    if self.source_only_pixel_values and self.parallel_context.cp_rank != 0:
+                        local_batch.pop("pixel_values", None)
+                    sources.append(local_batch)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                error = f"{type(exc).__name__}: {exc}"
+        else:
+            sources = [None] * num_micro_steps
+        if self.parallel_context.tp_world_size > 1:
+            payload = [(counts, error)]
+            dist.broadcast_object_list(
+                payload, group=self.parallel_context.tp_group, group_src=0, device=self.device
+            )
+            counts, error = payload[0]
+        if self.parallel_context.distributed_enabled:
+            failed = torch.tensor(int(error is not None), dtype=torch.int32, device=self.device)
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            if int(failed.item()):
+                errors = [None] * dist.get_world_size()
+                dist.all_gather_object(errors, error)
+                first = next((message for message in errors if message is not None), "unknown error")
+                raise ValueError(f"Omni CPU batch prefetch failed: {first}")
+        elif error is not None:
+            raise ValueError(f"Omni CPU batch prefetch failed: {error}")
+        return sources, {name: torch.tensor(value, device=self.device) for name, value in counts.items()}
 
     def __call__(
             self,
             data_iterator: Any,
             *,
             external_batch: Mapping[str, Any] | None = None,
+            prepared_cp_batch: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Read on TP0, slice token fields for CP, then broadcast within TP."""
         self._batch_index += 1
         local_batch = None
         if self.parallel_context.build_on_rank():
-            logger.debug("Omni get_batch: batch=%d source_read_begin", self._batch_index, enabled=True)
-            source_batch = external_batch if external_batch is not None else next(data_iterator)
-            if not isinstance(source_batch, Mapping):
-                raise TypeError("Omni DataLoader must yield a mapping batch")
+            if prepared_cp_batch is not None:
+                local_batch = prepared_cp_batch
+                logger.debug(
+                    "Omni get_batch: batch=%d source_ready prepared=True local_shape=%s",
+                    self._batch_index, tuple(local_batch["input_ids"].shape), enabled=True,
+                )
+            else:
+                logger.debug("Omni get_batch: batch=%d source_read_begin", self._batch_index, enabled=True)
+                source_batch = external_batch if external_batch is not None else next(data_iterator)
+                if not isinstance(source_batch, Mapping):
+                    raise TypeError("Omni DataLoader must yield a mapping batch")
+                normalized_batch = self._normalize_source_batch(source_batch)
+                local_batch = self.cp_sharder.shard(normalized_batch)
+                logger.debug(
+                    "Omni get_batch: batch=%d source_ready global_shape=%s local_shape=%s tp=%d cp=%d cp_rank=%d",
+                    self._batch_index, tuple(normalized_batch["input_ids"].shape),
+                    tuple(local_batch["input_ids"].shape), self.parallel_context.tp_world_size,
+                    self.parallel_context.cp_world_size, self.parallel_context.cp_rank, enabled=True,
+                )
 
-            normalized_batch = self._normalize_source_batch(source_batch)
-            local_batch = self.cp_sharder.shard(normalized_batch)
-            logger.debug(
-                "Omni get_batch: batch=%d source_ready global_shape=%s local_shape=%s tp=%d cp=%d cp_rank=%d",
-                self._batch_index, tuple(normalized_batch["input_ids"].shape),
-                tuple(local_batch["input_ids"].shape), self.parallel_context.tp_world_size,
-                self.parallel_context.cp_world_size, self.parallel_context.cp_rank, enabled=True,
-            )
-
-        device_batch = self.tp_broadcaster.broadcast(local_batch, broadcast_all_fields=True)
+        device_batch = self.tp_broadcaster.broadcast(
+            local_batch, broadcast_all_fields=True,
+            source_only_pixel_values=self.source_only_pixel_values,
+        )
         runtime_inputs = self._build_runtime_inputs(device_batch)
         model_inputs, loss_inputs = self._split_model_and_loss_inputs(device_batch)
+        if self.source_only_pixel_values and "encoder_parallel_plan" in runtime_inputs:
+            model_inputs.pop("pixel_values", None)
         model_inputs.update(runtime_inputs)
         # Shapes are host metadata; inspecting device tensor values here can stall collectives.
         logger.debug(
