@@ -23,6 +23,7 @@ from typing import Any, Callable
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.functional.clipped_activation import clipped_swiglu
 from hyper_parallel.components.modules.engram import local_token_mask
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
@@ -69,9 +70,7 @@ def _deepseek_v41_grouped_expert_forward(
         group_type=0,
         group_list_type=0,
     )
-    # Cast the packed projections once; the shared helper's casts are then no-ops.
-    gate, up = gate_up.float().chunk(2, dim=-1)
-    intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
+    intermediate = clipped_swiglu(gate_up, experts.limit)
     return grouped_matmul(  # pylint: disable=not-callable
         intermediate.to(hidden_states.dtype),
         experts.down_proj.transpose(1, 2),
