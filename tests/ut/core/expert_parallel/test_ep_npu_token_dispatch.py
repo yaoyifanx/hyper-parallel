@@ -188,8 +188,7 @@ def test_npu_ep_dispatcher_matches_reference(monkeypatch, token_dtype, enabled):
     reference_states = hidden_states.detach().clone().requires_grad_()
     reference_weights = topk_weights.detach().clone().requires_grad_()
     expert_routes = reference_states.flatten(0, 1).unsqueeze(1) * scales.unsqueeze(-1)
-    weights = reference_weights if enabled is None else reference_weights.to(token_dtype)
-    expected = (expert_routes * weights.unsqueeze(-1)).sum(dim=1)
+    expected = (expert_routes * reference_weights.unsqueeze(-1)).sum(dim=1)
     expected = expected.to(token_dtype).view_as(hidden_states)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 

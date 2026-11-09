@@ -758,7 +758,24 @@ def compressed_causal_topk_and_candidates(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select Full-layer Top-K and candidate blocks from one score pass."""
+    """Select Full-layer Top-K and candidate blocks from one score pass.
+
+    Args:
+        query: Query vectors shaped [batch, sequence, heads, head_dim].
+        key: Compressed keys shaped [batch, compressed_sequence, head_dim].
+        merge_weight: Per-query head weights shaped [batch, sequence, heads].
+        compress_ratio: Number of raw tokens represented by each compressed key.
+        sparse_count: Maximum number of selected compressed keys per query.
+        topk_blocks: Maximum number of candidate blocks per query.
+        block_size: Number of compressed keys in each candidate block.
+        query_offset: Absolute raw-token position of the first query.
+        query_chunk_size: Number of queries scored in one temporary allocation.
+        reduce_sum: Optional reduction of scores across head shards.
+        minimum_key_indices: Optional lower bound for each query's visible keys.
+
+    Returns:
+        Sorted compressed-key indices and candidate-block indices, padded with -1.
+    """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if query_chunk_size <= 0:
@@ -805,7 +822,7 @@ def compressed_causal_topk_and_candidates(
             scores.masked_fill_(key_positions < minimum, float("-inf"))
         top = scores.topk(top_k, dim=-1, sorted=False)
         indices = top.indices.masked_fill(~torch.isfinite(top.values), compressed_length)
-        indices = indices.sort(dim=-1).values
+        indices = sort_key_indices(indices, compressed_length)
         selected_chunks.append(indices.masked_fill(indices == compressed_length, -1).to(torch.int32))
         candidate_chunks.append(
             select_candidate_block_indices(
@@ -832,7 +849,24 @@ def compressed_candidate_topk(
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None = None,
         minimum_key_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Score only hierarchical candidate blocks and return global key ids."""
+    """Score only hierarchical candidate blocks and return global key ids.
+
+    Args:
+        query: Query vectors shaped [batch, sequence, heads, head_dim].
+        key: Compressed keys shaped [batch, compressed_sequence, head_dim].
+        merge_weight: Per-query head weights shaped [batch, sequence, heads].
+        candidate_blocks: Candidate block IDs for each query, with -1 padding.
+        compress_ratio: Number of raw tokens represented by each compressed key.
+        sparse_count: Maximum number of selected compressed keys per query.
+        block_size: Number of compressed keys in each candidate block.
+        query_offset: Absolute raw-token position of the first query.
+        query_chunk_size: Number of queries scored in one temporary allocation.
+        reduce_sum: Optional reduction of scores across head shards.
+        minimum_key_indices: Optional lower bound for each query's visible keys.
+
+    Returns:
+        Sorted global compressed-key indices, padded with -1 for missing keys.
+    """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if block_size <= 0:
@@ -869,7 +903,6 @@ def compressed_candidate_topk(
         )
 
     block_offsets = torch.arange(block_size, device=query.device)
-    batch_indices = torch.arange(batch_size, device=query.device).view(-1, 1, 1)
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
@@ -884,7 +917,7 @@ def compressed_candidate_topk(
         if minimum_key_indices is not None:
             valid = valid & (positions >= minimum_key_indices[:, start:end].unsqueeze(-1))
         safe_positions = positions.clamp(min=0, max=max(compressed_length - 1, 0))
-        selected_key = key[batch_indices, safe_positions].float()
+        selected_key = gather_selected_keys(key, safe_positions).float()
         dots = torch.einsum(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
@@ -897,10 +930,28 @@ def compressed_candidate_topk(
         top = scores.topk(top_k, dim=-1, sorted=False)
         selected = positions.gather(-1, top.indices)
         selected.masked_fill_(~torch.isfinite(top.values), compressed_length)
-        selected = selected.sort(dim=-1).values
+        selected = sort_key_indices(selected, compressed_length)
         selected.masked_fill_(selected == compressed_length, -1)
         selected_chunks.append(selected.to(torch.int32))
     return torch.cat(selected_chunks, dim=1)
+
+
+def _reference_kl_masks(topk_indices: torch.Tensor, query_chunk_size: int) -> tuple[torch.Tensor, list[bool]]:
+    """Prepare exact validity and copy all chunk activity to the host once.
+
+    Args:
+        topk_indices: Nonempty [batch, queries, selected] device indices, with -1 padding.
+        query_chunk_size: Positive number of query rows evaluated per chunk.
+
+    Returns:
+        Device row validity and a CPU list indicating whether each chunk has
+        any valid row across the batch. Each temporary slot mask covers at
+        most one chunk; no full-sequence slot mask is allocated.
+    """
+    rows = [(topk_indices[:, start:start + query_chunk_size] >= 0).any(dim=-1)
+            for start in range(0, topk_indices.shape[1], query_chunk_size)]
+    active = torch.stack([valid.any() for valid in rows])
+    return torch.cat(rows, dim=1), active.cpu().tolist()
 
 
 class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
@@ -921,21 +972,44 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
             query_chunk_size: int,
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Compute sparse KL and save only the three Indexer gradients."""
+        """Compute sparse KL and save only the three Indexer gradients.
+
+        Args:
+            ctx: Autograd context retaining the precomputed student gradients.
+            index_query: Student queries [batch, queries, index heads, index dim].
+            index_key: Student key bank [batch, keys, index dim].
+            merge_weight: Student head weights [batch, queries, index heads].
+            attention_query: Detached teacher queries [batch, attention heads, queries, head dim].
+            compressed_key: Detached teacher keys [batch, keys, head dim].
+            topk_indices: Selected key IDs [batch, queries, selected], with negative padding.
+            sinks: Detached teacher sink logits [attention heads].
+            attention_scale: Teacher dot-product scaling factor.
+            loss_coeff: KL coefficient, normalized by the full batch/query count.
+            query_chunk_size: Positive number of query rows evaluated per chunk.
+            reduce_sum: Optional tensor-parallel reduction of student and teacher scores.
+
+        Returns:
+            Scalar FP32 KL loss. Backward uses the three saved gradients and
+            does not differentiate the teacher or repeat validity preparation.
+        """
         batch_size, sequence_length, _, _ = index_query.shape
         denominator = batch_size * sequence_length
         total_loss = index_query.new_zeros((), dtype=torch.float32)
         grad_index_query = torch.zeros_like(index_query, dtype=torch.float32)
         grad_index_key = torch.zeros_like(index_key, dtype=torch.float32)
         grad_merge_weight = torch.zeros_like(merge_weight, dtype=torch.float32)
+        if topk_indices.numel() == 0:
+            ctx.save_for_backward(grad_index_query, grad_index_key, grad_merge_weight)
+            return total_loss
+        valid_rows_all, chunk_active = _reference_kl_masks(topk_indices, query_chunk_size)
 
         with torch.no_grad(), torch.autocast(device_type=index_query.device.type, enabled=False):
             for start in range(0, sequence_length, query_chunk_size):
                 end = min(start + query_chunk_size, sequence_length)
                 selected = topk_indices[:, start:end]
                 valid = selected >= 0
-                valid_rows = valid.any(dim=-1)
-                if not torch.any(valid_rows):
+                valid_rows = valid_rows_all[:, start:end]
+                if not chunk_active[start // query_chunk_size]:
                     continue
                 safe_indices = selected.clamp_min(0).long()
 
@@ -972,7 +1046,7 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 log_prediction = index_scores.log_softmax(dim=-1)
                 target_log = target.clamp_min(torch.finfo(torch.float32).tiny).log()
                 row_loss = (target * (target_log - log_prediction)).sum(dim=-1)
-                total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
+                total_loss.add_(row_loss.masked_fill(~valid_rows, 0.0).sum() * (loss_coeff / denominator))
 
                 grad_scores = log_prediction.exp() * target.sum(-1, keepdim=True) - target
                 grad_scores.mul_(loss_coeff / denominator)
