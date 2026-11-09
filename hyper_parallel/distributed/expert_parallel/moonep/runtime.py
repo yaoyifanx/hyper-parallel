@@ -33,6 +33,7 @@ from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import bind_ex
 from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import (
     MoonEPAllGatherExtension, MoonEPGradientExtension,
 )
+from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor, SparseMoonEPRuntime
 from hyper_parallel.distributed.expert_parallel.moonep.numerics import (
     ExpertSaved, expert_backward_values, expert_forward_values, grouped_values, grouped_weight_grad,
 )
@@ -879,23 +880,33 @@ def _configure_standalone_prefetch(model: torch.nn.Module, executors: list, pref
 
 
 def configure_moonep(model: torch.nn.Module, *,
-                     prefetch_depth: int | None = None) -> MoonEPRuntime:
+                     prefetch_depth: int | None = None) -> MoonEPRuntime | SparseMoonEPRuntime:
     """在模型物化与FSDP包装之后建立运行时；例如48层只按实际并发共享表槽。
 
     Args:
         model: 已绑定专家执行器的完整模型。
-        prefetch_depth: 仅无 FSDP 路径的参数；FSDP 模式不接受此参数。
+        prefetch_depth: 仅非融合 MoonEP 无 FSDP 路径的参数；稀疏路径与 FSDP 模式不接受此参数。
 
     Returns:
-        非融合 MoonEP 运行时；每次 optimizer 更新前调用 finish_step()。
+        非融合 MoonEP 或独立稀疏运行时；每次 optimizer 更新前调用 finish_step()。
 
     Note:
-        使用普通 loss.backward()。所有图和流结束后，各 rank 一起调用 close()。
+        稀疏路径要求所有 rank 在完整顺序前向后调用 runtime.backward(loss)，
+        且 retain_graph=False、create_graph=False；不能直接调用 loss.backward()。
+        非融合路径仍可使用普通 loss.backward()。所有图和流结束后，各 rank 一起调用 close()。
     """
     executors = [module._moonep_executor for module in model.modules()  # pylint: disable=protected-access
-                 if isinstance(getattr(module, "_moonep_executor", None), MoonEPExecutor)]
+                 if isinstance(getattr(module, "_moonep_executor", None), (MoonEPExecutor, SparseMoonEPExecutor))]
     if any(executor.runtime is not None for executor in executors):
         raise ValueError("同一模型不能重复配置MoonEP运行时")
+    if any(isinstance(executor, SparseMoonEPExecutor) for executor in executors):
+        if not all(isinstance(executor, SparseMoonEPExecutor) for executor in executors):
+            raise ValueError("一个模型不能混用稀疏融合与普通MoonEP执行器")
+        if prefetch_depth is not None:
+            raise ValueError("稀疏 MoonEP 不接受 prefetch_depth；FSDP 通知决定预取，无 FSDP 脚本按需恢复")
+        runtime = SparseMoonEPRuntime(executors)
+        model._moonep_runtime = runtime  # pylint: disable=protected-access
+        return runtime
     standalone_prefetch = _configure_standalone_prefetch(model, executors, prefetch_depth)
     runtime = MoonEPRuntime(executors, standalone_prefetch=standalone_prefetch)
     model._moonep_runtime = runtime  # pylint: disable=protected-access
@@ -904,5 +915,5 @@ def configure_moonep(model: torch.nn.Module, *,
 
 def has_moonep(module: torch.nn.Module) -> bool:
     """检查是否含生命周期执行器；例如普通EP模型返回False，保持已有构建行为。"""
-    return any(isinstance(getattr(child, "_moonep_executor", None), MoonEPExecutor)
+    return any(isinstance(getattr(child, "_moonep_executor", None), (MoonEPExecutor, SparseMoonEPExecutor))
                for child in module.modules())

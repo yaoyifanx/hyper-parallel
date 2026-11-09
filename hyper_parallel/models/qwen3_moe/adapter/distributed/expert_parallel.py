@@ -31,6 +31,7 @@ import torch
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
 from hyper_parallel.distributed.expert_parallel.moonep import MoonEPExecutor
+from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_route_ids
 from hyper_parallel.distributed.expert_parallel.moonep.runtime import local_tensor
 
@@ -60,6 +61,7 @@ def qwen3moe_ep_compute_fn(
     fix_router: bool = False,
     use_moonep: bool = False,
     use_megamoe: bool = False,
+    megamoe_fused: bool = False,
     moonep_replica_capacity: int | None = None,
     moonep_prefetch_depth: int = 1,
     moonep_token_dedup: bool = False,
@@ -77,9 +79,10 @@ def qwen3moe_ep_compute_fn(
         use_grouped_gemm: 普通EP基线是否采用grouped GEMM。
         fix_router: 普通EP基线是否采用仅供性能测试的均衡路由。
         use_moonep: 是否启用MoonEP的动态专家放置。
-        use_megamoe: 单独启用MegaMoE，与非融合MoonEP互斥。
+        use_megamoe: 单独启用MegaMoE；与MoonEP组合时选择独立稀疏执行器。
+        megamoe_fused: 兼容旧配置的组合开关；组合路径使用独立稀疏执行器。
         moonep_replica_capacity: 不同远程专家数上限；None取E/EP。
-        moonep_prefetch_depth: 仅无 FSDP 路径使用；0按需恢复，1提前恢复。
+        moonep_prefetch_depth: 仅旧 MoonEP 无 FSDP 路径使用；0按需恢复，1提前恢复。稀疏路径由 FSDP 通知预取。
         moonep_token_dedup: 是否在 MoonEP token 传输中启用按目标 rank 去重。
         moonep_fwd_ratio: 前向向量压缩的最大唯一率；None 使用默认值 0.75。
         moonep_bwd_ratio: 反向 dX 压缩的唯一率界限；None 使用默认值 1.0。
@@ -95,18 +98,20 @@ def qwen3moe_ep_compute_fn(
         raise ValueError("moonep_token_dedup must be a boolean")
     if moonep_token_dedup and not use_moonep:
         raise ValueError("moonep_token_dedup requires use_moonep")
-    if use_moonep and use_megamoe:
-        raise ValueError("The nonfused MoonEP executor cannot select standalone MegaMoE")
+    if megamoe_fused and not (use_moonep and use_megamoe):
+        raise ValueError("Qwen MegaMoE外部路由需要同时启用MoonEP和MegaMoE")
     if use_moonep:
         if fix_router:
             raise ValueError("Qwen MoonEP不支持仅供性能测试的均衡路由，请使用自然路由")
         if ep_mesh is None:
             raise ValueError("Qwen MoonEP需要显式EP mesh")
         experts = module.experts
+        executor_type = SparseMoonEPExecutor if use_megamoe else MoonEPExecutor
         options = {"token_dedup": moonep_token_dedup,
                    "forward_ratio": moonep_fwd_ratio, "backward_ratio": moonep_bwd_ratio}
-        options.update(activation="swiglu", prefetch_depth=moonep_prefetch_depth)
-        experts._moonep_executor = MoonEPExecutor(  # pylint: disable=protected-access
+        if not use_megamoe:
+            options.update(activation="swiglu", prefetch_depth=moonep_prefetch_depth)
+        experts._moonep_executor = executor_type(  # pylint: disable=protected-access
             experts, partial(_qwen_expert_weights, experts),
             ep_group=ep_mesh.get_group("ep"), ep_size=ep_mesh["ep"].size(),
             num_experts=module.gate.num_experts, top_k=module.gate.top_k,

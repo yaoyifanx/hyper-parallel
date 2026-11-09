@@ -485,24 +485,22 @@ class TestEpFactoryContract(unittest.TestCase):
         parameters = list(inspect.signature(factory).parameters.values())
         self.assertEqual(
             [param.name for param in parameters],
-            ['module', 'mesh', 'tp_mesh', 'cp_mesh', 'ep_mesh', 'use_grouped_gemm', 'fix_router',
-             'use_moonep', 'use_megamoe', 'moonep_replica_capacity', 'moonep_prefetch_depth',
-             'moonep_token_dedup', 'moonep_fwd_ratio', 'moonep_bwd_ratio'],
+            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
+             "fix_router", "use_moonep", "use_megamoe", "megamoe_fused", "moonep_replica_capacity",
+             "moonep_prefetch_depth", "moonep_token_dedup", "moonep_fwd_ratio", "moonep_bwd_ratio"],
         )
         for param in parameters:
             self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
         for param in parameters[:5]:
             self.assertIs(param.default, inspect.Parameter.empty)
         self.assertEqual({param.name: param.default for param in parameters[5:]}, {
-            'use_grouped_gemm': False,
-            'fix_router': False,
-            'use_moonep': False,
-            'use_megamoe': False,
-            'moonep_replica_capacity': None,
-            'moonep_prefetch_depth': 1,
-            'moonep_token_dedup': False,
-            'moonep_fwd_ratio': None,
-            'moonep_bwd_ratio': None,
+            "use_grouped_gemm": False, "fix_router": False, "use_moonep": False,
+            "use_megamoe": False, "megamoe_fused": False,
+            "moonep_replica_capacity": None,
+            "moonep_prefetch_depth": 1,
+            "moonep_token_dedup": False,
+            "moonep_fwd_ratio": None,
+            "moonep_bwd_ratio": None,
         })
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

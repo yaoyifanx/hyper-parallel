@@ -38,6 +38,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
 )
 from hyper_parallel.distributed.expert_parallel.moonep import MoonEPExecutor
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_route_ids
+from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor
 from hyper_parallel.distributed.expert_parallel.moonep.runtime import local_tensor
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
 
@@ -106,6 +107,9 @@ def _deepseek_v41_moonep_expert_forward(
         再用昇腾 GMM 执行本 rank 获得的专家。
     """
     executor = experts._moonep_executor  # pylint: disable=protected-access
+    if isinstance(executor, SparseMoonEPExecutor):
+        # Keep router precision for the fused combine and its score gradient.
+        top_k_weights = top_k_weights.contiguous()
     return executor(
         hidden_states, top_k_index, top_k_weights,
         expert_weights=_deepseek_moonep_weights(experts),
@@ -249,6 +253,8 @@ def deepseek_v41_ep_compute_fn(
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
         use_moonep: bool = False,
+        use_megamoe: bool = False,
+        megamoe_fused: bool = False,
         moonep_replica_capacity: int | None = None,
         moonep_prefetch_depth: int = 1,
         moonep_token_dedup: bool = False,
@@ -270,8 +276,10 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Expert-parallel mesh owning the routed experts.
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
         use_moonep: 使用脚本版MoonEP动态均衡及GMM；与基线use_grouped_gemm互斥。
+        use_megamoe: 与 MoonEP 组合时使用独立稀疏专家执行器。
+        megamoe_fused: 兼容已有实验配置；组合路径同样由 use_megamoe 选择。
         moonep_replica_capacity: 每卡不同远程专家上限B；None默认本rank专家数。
-        moonep_prefetch_depth: 生命周期非融合路径的反向预取深度。
+        moonep_prefetch_depth: 生命周期非融合路径的反向预取深度；稀疏路径使用 FSDP 通知预取。
         moonep_token_dedup: 是否在 MoonEP token 传输中启用按目标 rank 去重。
         moonep_fwd_ratio: 前向向量压缩的最大唯一率；None 使用默认值 0.75。
         moonep_bwd_ratio: 反向 dX 压缩的唯一率界限；None 使用默认值 1.0。
@@ -297,6 +305,10 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("moonep_token_dedup must be a boolean")
     if moonep_token_dedup and not use_moonep:
         raise ValueError("moonep_token_dedup requires MoonEP")
+    if megamoe_fused and not (use_moonep and use_megamoe):
+        raise ValueError("megamoe_fused requires MoonEP and MegaMoE")
+    if use_megamoe and not use_moonep:
+        raise ValueError("DeepSeek sparse MegaMoE requires MoonEP")
     if use_moonep and use_grouped_gemm:
         raise ValueError("use_moonep 与 use_grouped_gemm 分别选择两条 EP 路径，不能同时启用")
     if (use_moonep and isinstance(module.experts, DeepseekV41MegaMoeExperts)
@@ -310,10 +322,14 @@ def deepseek_v41_ep_compute_fn(
     if use_moonep:
         swiglu_limit = _deepseek_moonep_limit(module.experts)
         module.gate.route_indices_selector = checkpoint_route_ids
+        executor_type = SparseMoonEPExecutor if use_megamoe else MoonEPExecutor
         options = {"token_dedup": moonep_token_dedup,
                    "forward_ratio": moonep_fwd_ratio, "backward_ratio": moonep_bwd_ratio}
-        options.update(swiglu_limit=swiglu_limit, prefetch_depth=moonep_prefetch_depth)
-        module.experts._moonep_executor = MoonEPExecutor(  # pylint: disable=protected-access
+        if use_megamoe:
+            options["swiglu_limit"] = swiglu_limit if swiglu_limit > 0 else None
+        else:
+            options.update(swiglu_limit=swiglu_limit, prefetch_depth=moonep_prefetch_depth)
+        module.experts._moonep_executor = executor_type(  # pylint: disable=protected-access
             module.experts, partial(_deepseek_moonep_weights, module.experts),
             ep_group=ep_group, ep_size=ep_size, num_experts=module.experts.num_experts,
             top_k=module.gate.top_k, replica_capacity=moonep_replica_capacity,
