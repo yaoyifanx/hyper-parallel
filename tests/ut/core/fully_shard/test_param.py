@@ -16,7 +16,6 @@
 # pylint: disable=protected-access
 
 import gc
-import os
 import unittest
 import weakref
 from functools import partial
@@ -42,6 +41,7 @@ from hyper_parallel.core.fully_shard.hsdp_param import (
     ReduceScatterCommCtx,
     HSDPParamV2,
 )
+from tests.common.mark_utils import arg_mark
 
 
 def _new_param():
@@ -124,6 +124,153 @@ def _new_materialized_single_shard_param(model_dtype=torch.bfloat16):
 class TestTorchHSDPParamHelpers(unittest.TestCase):
     """Cover parameter helper behavior without constructing real device meshes."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_async_all_gather_retains_cast_input_until_wait(self) -> None:
+        """Feature: Asynchronous parameter gathering.
+        Description: Borrow the cast input through success and failure waits.
+        Expectation: Input storage survives until a successful wait and is then released.
+        """
+        for wait_fails in (False, True):
+            with self.subTest(wait_fails=wait_fails):
+                parameter = _new_param()
+                parameter.param_dtype = torch.bfloat16
+                parameter.mesh_info.shard_process_group = "test-group"
+                parameter.init_unsharded_param = MagicMock()
+                parameter.to_unsharded = MagicMock()
+                references = {}
+
+                def wait() -> None:
+                    """Verify that completion never observes a released input."""
+                    self.assertIsNotNone(references["input"]())
+                    if wait_fails:
+                        raise RuntimeError("gather failed")
+
+                work = SimpleNamespace(wait=wait)
+
+                def gather(output: torch.Tensor, source: torch.Tensor, **_kwargs: object) -> SimpleNamespace:
+                    """Borrow the source without a backend strong reference."""
+                    references["input"] = weakref.ref(source)
+                    output.copy_(source.repeat(2))
+                    return work
+
+                # A Mock would retain the source in call_args and hide this bug.
+                with patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_gather_into_tensor", new=gather):
+                    parameter.unshard(async_op=True)
+                gc.collect()
+                self.assertIsNotNone(references["input"]())
+                if wait_fails:
+                    with self.assertRaisesRegex(RuntimeError, "gather failed"):
+                        parameter.wait_for_unshard()
+                    self.assertIsNotNone(references["input"]())
+                    self.assertIs(parameter.allgather_comm_ctx.allgather_handle, work)
+                else:
+                    parameter.wait_for_unshard()
+                    gc.collect()
+                    self.assertIsNone(references["input"]())
+                    self.assertIsNone(parameter.allgather_comm_ctx.allgather_handle)
+                    self.assertIsNone(parameter.allgather_comm_ctx.allgather_input)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_all_gather_records_waiting_stream_after_backend_cleanup(self) -> None:
+        """Feature: Cross-stream gather lifetime.
+        Description: Wait and unpack using a simulated consumer stream.
+        Expectation: Stream records follow backend cleanup and precede unpacking.
+        """
+        parameter = _new_param()
+        parameter.device = torch.device("cuda", 0)
+        events = []
+        stream = object()
+
+        def buffer(name: str) -> SimpleNamespace:
+            """Observe lifetime registration without initializing a device."""
+            return SimpleNamespace(record_stream=lambda value: events.append((name, value)))
+
+        parameter.allgather_comm_ctx.allgather_input = buffer("input")
+        parameter.unsharded_param_buffers = [buffer("unsharded")]
+        parameter.allgather_comm_ctx.allgather_output = buffer("packed")
+        parameter.allgather_comm_ctx.allgather_handle = SimpleNamespace(wait=lambda: events.append("wait"))
+        parameter.init_unsharded_param = lambda: events.append("unpack")
+        parameter.to_unsharded = lambda: events.append("expose")
+        module = SimpleNamespace(current_stream=lambda device: stream)
+
+        with patch("hyper_parallel.core.fully_shard.hsdp_param.torch.get_device_module", return_value=module):
+            parameter.wait_for_unshard()
+
+        self.assertEqual(events, ["wait", ("input", stream), ("unsharded", stream),
+                                  ("packed", stream), "unpack", "expose"])
+        self.assertIsNone(parameter.allgather_comm_ctx.allgather_input)
+
+    @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_gather_into_tensor")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_borrowed_all_gather_input_reuses_latest_shard(self, collective):
+        """Feature: Borrowed gather input.
+        Description: Reuse one shared conversion buffer after a shard update.
+        Expectation: Each gather reads the newest shard without replacing the shared storage.
+        """
+        parameter = _new_param()
+        parameter.param_dtype = torch.bfloat16
+        parameter.mesh_info.shard_process_group = "test-group"
+        storage = torch.empty(4, dtype=torch.bfloat16)
+        borrowed = storage[:2]
+        address = storage.data_ptr()
+
+        def gather(output: torch.Tensor, source: torch.Tensor, **_kwargs: object) -> MagicMock:
+            """模拟两份分片；例如本地[1,2]得到[1,2,1,2]。"""
+            output.copy_(source.repeat(2))
+            return MagicMock()
+
+        collective.side_effect = gather
+        for offset in (0, 10):
+            parameter._sharded_param_data.copy_(torch.tensor([1.0, 2.0]) + offset)
+            parameter.unshard(async_op=True, input_buffer=borrowed)
+            torch.testing.assert_close(parameter.unsharded_param_buffers[0],
+                                       (torch.tensor([1.0, 2.0]).repeat(2) + offset).bfloat16())
+            self.assertEqual(collective.call_args.args[1].data_ptr(), address)
+            parameter.allgather_comm_ctx.allgather_handle.wait()
+            parameter.allgather_comm_ctx.allgather_handle = None
+            parameter.free_unsharded_param()
+            self.assertEqual(storage.untyped_storage().nbytes(), 8)
+        self.assertEqual(collective.call_count, 2)
+
+    def test_borrowed_all_gather_input_rejects_invalid_storage(self):
+        """不能借用错误dtype或shape；例如两个BF16元素不能由FP32池冒充。"""
+        parameter = _new_param()
+        parameter.param_dtype = torch.bfloat16
+        for buffer in [torch.empty(2), torch.empty(3, dtype=torch.bfloat16),
+                       torch.empty(4, dtype=torch.bfloat16)[::2]]:
+            with self.assertRaisesRegex(ValueError, "借用的 AG 输入"):
+                parameter.copy_all_gather_input(buffer)
+
+    def test_borrowed_all_gather_input_rejects_no_collective_alias(self):
+        """无AG时不能让参数接管借用池；例如单卡reshard不可清零外部共享storage。"""
+        for world_size, group in [(1, "group"), (2, None)]:
+            parameter = _new_param()
+            parameter.param_dtype = torch.bfloat16
+            parameter.shard_world_size = world_size
+            parameter.mesh_info.shard_process_group = group
+            buffer = torch.empty(2, dtype=torch.bfloat16)
+            with self.assertRaisesRegex(ValueError, "实际执行 all-gather"):
+                parameter.unshard(input_buffer=buffer)
+            self.assertEqual(buffer.untyped_storage().nbytes(), 4)
+            self.assertEqual(parameter.unsharded_param_buffers, [])
+
+
+
+    @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_gather_into_tensor")
+    def test_ag_and_rs_reuse_mesh_shard_group(self, mock_all_gather, mock_reduce_scatter):
+        """Parameter AG and gradient RS both use the mesh's shard group."""
+        param = _new_param()
+        param.param_dtype = None
+        param.mesh_info.shard_process_group = "shard-group"
+
+        param._get_unsharded_param_data(async_op=True)
+        param._unsharded_param.grad = torch.ones(4)
+        param.reduce_scatter_grad(async_op=True)
+
+        self.assertEqual(mock_all_gather.call_args.kwargs["group"], "shard-group")
+        self.assertEqual(mock_reduce_scatter.call_args.kwargs["group"], "shard-group")
+
     def test_reduce_comm_dtype_prefers_parameter_policy_and_falls_back_to_grad(self):
         """Effective reduction dtype should be resolved entirely by the parameter."""
         hsdp_param = _new_param()
@@ -199,8 +346,12 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         self.assertTrue(hsdp_param.sharded_param._local_tensor.requires_grad)
         self.assertTrue(hsdp_param.sharded_param._local_tensor.is_leaf)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_reset_materialized_local_tensor_swaps_dtensor_storage(self):
-        """Materialization should align both DTensor storage references without replacing the Parameter."""
+        """Feature: Materialized parameter storage.
+        Description: Reset a materialized distributed parameter.
+        Expectation: The parameter identity persists while its local storage is refreshed.
+        """
         module = torch.nn.Module()
         module.weight = torch.nn.Parameter(torch.empty(4, device="meta"))
         module_info = ParamModuleInfo(module, "weight", [], [])
@@ -240,7 +391,8 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
             original_sharded_param._local_tensor.untyped_storage().data_ptr(),
             materialized_local_tensor.untyped_storage().data_ptr(),
         )
-        with torch._C.DisableTorchFunctionSubclass():
+        # The compiled guard exposes its context-manager protocol only at runtime.
+        with torch._C.DisableTorchFunctionSubclass():  # pylint: disable=not-context-manager
             tensor_impl_storage = original_sharded_param.untyped_storage()
         local_tensor_storage = original_sharded_param._local_tensor.untyped_storage()
         self.assertEqual(tensor_impl_storage.device, local_tensor_storage.device)
@@ -976,8 +1128,12 @@ class TestParameterHookMigrator(unittest.TestCase):
         self.assertEqual(list(target_param._backward_hooks.values()), [hook_a, hook_b])
         self.assertTrue(target_param.migrate_backward_hooks_run_once)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_migrate_continues_after_registration_error_and_marks_frozen_target(self):
-        """Registration errors should not stop later hooks, and frozen targets should be marked."""
+        """Feature: Parameter hook migration.
+        Description: Migrate hooks through a registration error and a frozen target.
+        Expectation: Remaining hooks migrate once and both targets receive a completion marker.
+        """
         hook_a = MagicMock()
         hook_b = MagicMock()
         migrator = ParameterHookMigrator()
@@ -988,7 +1144,10 @@ class TestParameterHookMigrator(unittest.TestCase):
         class _TargetParam:
             """Minimal parameter double for hook migration."""
 
+            migrate_backward_hooks_run_once: bool
+
             def __init__(self, requires_grad: bool) -> None:
+                """Prepare a hook target without an existing migration marker."""
                 self.requires_grad = requires_grad
                 self.register_hook = MagicMock()
 

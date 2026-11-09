@@ -14,7 +14,6 @@
 # ==========================================================================
 """Unit tests for Torch HSDP fused communication buckets."""
 # pylint: disable=protected-access
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,7 +26,6 @@ import torch.distributed as dist
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.core.fully_shard.param_group import (
-    AllGatherMetadata,
     AllGatherResult,
     AllReduceParamGroup,
     HSDPParamGroup,
@@ -214,6 +212,22 @@ class TestParamGroupHelpers(unittest.TestCase):
 
 class TestAllGatherBuckets(unittest.TestCase):
     """Cover ordered dtype buckets and all-gather buffer ownership."""
+
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
+    def test_ag_and_rs_reuse_mesh_shard_group(self, mock_all_gather, mock_reduce_scatter):
+        """Parameter AG and gradient RS both use the mesh's shard group."""
+        shard_group = _FakeGroup()
+        param = _fake_param([1.0, 2.0], mesh_info=_mesh_info(shard_group=shard_group))
+        group = HSDPParamGroup([param], device=torch.device("cpu"), enable_zero_copy=False)
+
+        group.foreach_all_gather(async_op=True)
+        _set_unsharded_grad(param, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        group.foreach_reducescatter(dist.ReduceOp.SUM)
+
+        self.assertIs(mock_all_gather.call_args.kwargs["group"], shard_group)
+        self.assertIs(mock_reduce_scatter.call_args.kwargs["group"], shard_group)
+        self.assertIs(param.mesh_info.shard_process_group, shard_group)
 
     def test_init_all_gather_buckets_groups_by_process_group_and_dtype(self):
         """All-gather buckets should group parameters by process group and dtype."""

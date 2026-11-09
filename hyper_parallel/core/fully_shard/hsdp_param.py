@@ -71,16 +71,18 @@ class AllReduceCommCtx:
 
 @dataclass
 class AllGatherCommCtx:
-    """Per-parameter all-gather output and asynchronous work."""
+    """Per-parameter all-gather buffers and asynchronous work."""
 
     allgather_output: Optional[torch.Tensor] = None
     allgather_handle: Optional[dist.Work] = None
+    allgather_input: Optional[torch.Tensor] = None
 
 
 class ParameterHookMigrator:
     """Preserve parameter backward hooks across HSDP parameter replacement."""
 
     def __init__(self) -> None:
+        """Initialize the hook registry preserved across parameter replacement."""
         self._orig_param_hooks: List[Callable] = []
         self._saved_hook_ids: set[int] = set()
 
@@ -140,7 +142,7 @@ class HSDPParamV2:
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
         source_shard_info: Optional[SourceShardMetaInfo] = None,
-    ):
+    ) -> None:
         """
         Initialize HSDPParamV2 and shard the parameter.
 
@@ -392,6 +394,11 @@ class HSDPParamV2:
 
     @reduce_partial_output.setter
     def reduce_partial_output(self, value: Optional[torch.Tensor]) -> None:
+        """Replace accumulated contributions.
+
+        Args:
+            value: Partial reduced gradient, or None after consumption.
+        """
         self._reduce_partial_output = value
 
     def reduce_comm_dtype(self, grad: Optional[torch.Tensor] = None) -> torch.dtype:
@@ -572,6 +579,23 @@ class HSDPParamV2:
             spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
         self._spmd_placements = tuple(spmd_placements)
 
+    def _init_mesh_sizes(self) -> None:
+        """Resolve shard and replica counts before parameter partitioning."""
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
+        else:
+            self.shard_rank = 0
+            self.shard_world_size = 1
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
+        )
+
     @torch.no_grad()
     def _init_sharded_param(
         self,
@@ -593,21 +617,7 @@ class HSDPParamV2:
             )
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            self.shard_rank = self.mesh_info.shard_mesh_rank
-            self.shard_world_size = self.mesh_info.shard_mesh_size
-        else:
-            self.shard_rank = 0
-            self.shard_world_size = 1
-        if isinstance(self.mesh_info, DDPMeshInfo):
-            self.replicate_world_size = self.mesh_info.replicate_mesh_size
-        else:
-            self.replicate_world_size = 1
-        self.is_replicate_param = (
-            isinstance(self.mesh_info, DDPMeshInfo)
-            and not isinstance(self.mesh_info, HSDPMeshInfo)
-        )
+        self._init_mesh_sizes()
 
         self._init_shard_placements(
             param_data,
@@ -681,7 +691,7 @@ class HSDPParamV2:
         world_size: int,
         device: torch.device,
         force_recreate: bool = False,
-    ):
+    ) -> None:
         """
         Allocate buffers that hold unsharded parameter data.
 
@@ -1043,17 +1053,24 @@ class HSDPParamV2:
             torch._C._swap_tensor_impl(self.sharded_param, local_tensor_data)  # pylint: disable=W0212
 
     @torch.no_grad()
-    def _get_unsharded_param_data(self, async_op: bool = False) -> None:
+    def _get_unsharded_param_data(self, async_op: bool = False,
+                                 input_buffer: Optional[torch.Tensor] = None) -> None:
         """
         Perform all-gather to get unsharded parameter data.
 
         Args:
             async_op: Whether to execute asynchronously.
+            input_buffer: 可选的借用转换输入；例如 BF16 共享发送区中的连续切片。
 
         The output buffer and optional asynchronous handle are stored in the
         parameter communication context.
         """
-        all_gather_input = self.all_gather_inputs[0]
+        if input_buffer is None:
+            all_gather_input = self.all_gather_inputs[0]
+        else:
+            if self.shard_world_size <= 1 or self.mesh_info.shard_process_group is None:
+                raise ValueError("借用 AG 输入只支持实际执行 all-gather 的分片参数")
+            all_gather_input = self.copy_all_gather_input(input_buffer)
 
         if self.shard_world_size <= 1 or self.mesh_info.shard_process_group is None:
             if len(self.unsharded_param_buffers) == 0:
@@ -1074,6 +1091,7 @@ class HSDPParamV2:
         )
         self.alloc_unsharded_param_buffers()
 
+        self.allgather_comm_ctx.allgather_input = all_gather_input
         self.allgather_comm_ctx.allgather_output = self.unsharded_param_buffers[0]
         if self.hsdp_placement.dim != 0:
             # Non-dim-0 sharding uses an extra all-gather buffer before
@@ -1096,16 +1114,48 @@ class HSDPParamV2:
             self.allgather_comm_ctx.allgather_output = None
 
 
-    def unshard(self, async_op: bool = False) -> None:
-        """Start gathering the full parameter when no gather is already pending.
+    @torch.no_grad()
+    def copy_all_gather_input(self, buffer: torch.Tensor) -> torch.Tensor:
+        """将本地分片写入借用的 AG 输入，不改变完整参数的存储。
 
         Args:
-            async_op: Whether to launch the all-gather asynchronously.
+            buffer: 与本地分片同形状、计算 dtype、同设备的连续存储。
+
+        Returns:
+            已填充的原 buffer；AG 读取结束前调用方不能覆盖。
+
+        Example:
+            FP32 分片 [1,2] 复制到 BF16 池的 [0,2)；另一参数借不重叠切片，
+            两个 AG 都等待完毕后才可复用整个池。
+        """
+        self._assert_in_states(ShardedState.SHARDED)
+        source = self._sharded_param_data
+        dtype = self.param_dtype if self.param_dtype is not None else source.dtype
+        if (self.offload_to_cpu or buffer.shape != source.shape or buffer.dtype != dtype
+                or buffer.device != source.device or not buffer.is_contiguous()
+                or buffer.requires_grad):
+            raise ValueError("借用的 AG 输入必须匹配无 offload 分片的 shape、dtype 和 device 且连续")
+        buffer.copy_(source)
+        return buffer
+
+    def unshard(self, async_op: bool = False,
+                input_buffer: Optional[torch.Tensor] = None) -> None:
+        """没有在途 AG 时恢复完整参数，可使用借用的转换输入。
+
+        Args:
+            async_op: 是否异步发起 AG。
+            input_buffer: 借用输入，AG 完成前由调用方保活。
+
+        Example:
+            两层顺序借同一 BF16 池；先等待上一层 AG，再覆盖池中分片。
         """
         if self.allgather_comm_ctx.allgather_handle is not None:
             # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
-        self._get_unsharded_param_data(async_op=async_op)
+        if input_buffer is None:
+            self._get_unsharded_param_data(async_op=async_op)
+        else:
+            self._get_unsharded_param_data(async_op=async_op, input_buffer=input_buffer)
 
 
     def wait_for_unshard(self) -> None:
@@ -1115,6 +1165,18 @@ class HSDPParamV2:
         if self.allgather_comm_ctx.allgather_handle is not None:
             self.allgather_comm_ctx.allgather_handle.wait()
             self.allgather_comm_ctx.allgather_handle = None
+
+        all_gather_input = self.allgather_comm_ctx.allgather_input
+        if all_gather_input is not None and self.device.type != "cpu":
+            # A prefetched gather may be waited on a different stream. Its input
+            # must survive backend wait cleanup, which may release saved tensors.
+            # Record afterwards so that cleanup cannot erase this dependency.
+            stream = torch.get_device_module(self.device).current_stream(self.device)
+            all_gather_input.record_stream(stream)
+            self.unsharded_param_buffers[0].record_stream(stream)
+            if self.allgather_comm_ctx.allgather_output is not None:
+                self.allgather_comm_ctx.allgather_output.record_stream(stream)
+        self.allgather_comm_ctx.allgather_input = None
 
         self.init_unsharded_param()
         self.to_unsharded()

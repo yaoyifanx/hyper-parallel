@@ -1,0 +1,87 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""CPU coverage of sparse MoonEP route conservation and inverse placement."""
+
+from dataclasses import astuple
+import unittest
+
+import torch
+
+from hyper_parallel.distributed.expert_parallel.moonep.fused.plan import compile_local_route
+from tests.common.mark_utils import arg_mark
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+class TestSparsePlan(unittest.TestCase):
+    """Validate individual selection ownership, including empty ranks and tails."""
+
+    def test_split_expert_offsets(self):
+        """Splitting e0 preserves source order while packing only active experts."""
+        counts = torch.tensor([[4, 3, 0, 0], [1, 0, 0, 0]])
+        allocation = torch.tensor([[1, 4], [3, 0], [0, 0], [0, 0]])
+        routes = [compile_local_route(counts, allocation, rank) for rank in range(2)]
+        self.assertEqual(routes[0].active_experts, (0, 1))
+        self.assertEqual(routes[1].active_experts, (0,))
+        self.assertEqual(routes[0].boundaries, (1, 4))
+        self.assertEqual(routes[1].boundaries, (4,))
+        self.assertEqual([astuple(edge) for edge in routes[0].outgoing],
+                         [(0, 0, 0, 0, 0, 1), (0, 1, 0, 1, 0, 3), (0, 0, 1, 4, 1, 3)])
+        self.assertEqual([astuple(edge) for edge in routes[1].outgoing], [(1, 1, 0, 0, 3, 1)])
+        self.assertEqual([block.rows for edge in routes[0].outgoing if edge.target != 0
+                          for block in edge.blocks(2)], [2, 1])
+
+    def test_empty_routes_have_no_tasks(self):
+        """Zero rows create neither artificial slots nor zero-length messages."""
+        counts = torch.zeros(2, 4, dtype=torch.int64)
+        allocation = torch.zeros(4, 2, dtype=torch.int64)
+        routes = [compile_local_route(counts, allocation, rank) for rank in range(2)]
+        for route in routes:
+            self.assertEqual(route.active_experts, ())
+            self.assertEqual(route.outgoing, ())
+            self.assertEqual(route.incoming, ())
+
+    def test_random_routes_are_bijective(self):
+        """An independent row-by-row oracle checks conservation and exact order."""
+        generator = torch.Generator().manual_seed(2718)
+        for ranks in (1, 2, 3, 16):
+            for trial in range(12):
+                experts = 2 * ranks
+                counts = torch.randint(0, 5, (ranks, experts), generator=generator)
+                allocation = torch.zeros(experts, ranks, dtype=torch.int64)
+                expected = [[] for _ in range(ranks)]
+                source_rows = [[] for _ in range(ranks)]
+                for expert in range(experts):
+                    rows = [(src, expert, row) for src in range(ranks) for row in range(int(counts[src, expert]))]
+                    destinations = torch.randint(ranks, (len(rows),), generator=generator).sort().values.tolist()
+                    for row, dst in zip(rows, destinations):
+                        allocation[expert, dst] += 1
+                        expected[dst].append(row)
+                    for src in range(ranks):
+                        source_rows[src].extend(row for row in rows if row[0] == src)
+                routes = [compile_local_route(counts, allocation, rank) for rank in range(ranks)]
+                actual = [[None] * route.received_rows for route in routes]
+                seen = [set() for _ in range(ranks)]
+                for route in routes:
+                    for edge in route.outgoing:
+                        for offset in range(edge.rows):
+                            row = edge.source_row + offset
+                            self.assertNotIn(row, seen[edge.source])
+                            seen[edge.source].add(row)
+                            target_row = edge.target_row + offset
+                            self.assertIsNone(actual[edge.target][target_row])
+                            actual[edge.target][target_row] = source_rows[edge.source][row]
+                with self.subTest(ranks=ranks, trial=trial):
+                    self.assertEqual(actual, expected)
+                    self.assertEqual([len(rows) for rows in seen], [len(rows) for rows in source_rows])
