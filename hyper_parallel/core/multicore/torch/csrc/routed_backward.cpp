@@ -1,0 +1,173 @@
+// Copyright 2026 Huawei Technologies Co., Ltd
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// ============================================================================
+
+#include <ATen/ATen.h>
+#include <torch/library.h>
+#include <vector>
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUGuard.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
+#include "backward.h"
+#include "gradient.h"
+#include "transport.h"
+
+namespace {
+
+void CheckStorage(const at::Tensor &value, const at::Tensor &anchor, at::ScalarType dtype) {
+  TORCH_CHECK(value.device() == anchor.device() && value.is_contiguous() && value.scalar_type() == dtype,
+              "backward tail operands must be contiguous with the expected device and dtype");
+  if (!value.numel()) {
+    return;
+  }
+  TORCH_CHECK(value.storage_offset() >= 0 && value.storage().nbytes() / value.element_size() >=
+                static_cast<uint64_t>(value.storage_offset() + value.numel()) &&
+                reinterpret_cast<uintptr_t>(value.data_ptr()) % 32 == 0,
+              "backward tail operand has invalid or unaligned storage");
+}
+
+void CheckTasks(const at::Tensor &tasks, int64_t fields) {
+  TORCH_CHECK(tasks.dim() == 2 && tasks.size(1) == fields && tasks.size(0) > 0 && tasks.size(0) <= INT32_MAX,
+              "backward tail tasks must contain nonempty canonical descriptors");
+}
+
+void CheckAliases(const std::vector<at::Tensor> &values, size_t readers) {
+  for (size_t writer = readers; writer < values.size(); ++writer) {
+    for (size_t index = 0; index < values.size(); ++index) {
+      if (index == writer || !values[writer].numel() || !values[index].numel()) {
+        continue;
+      }
+      const auto start = reinterpret_cast<uintptr_t>(values[writer].data_ptr());
+      const auto other = reinterpret_cast<uintptr_t>(values[index].data_ptr());
+      const auto bytes = values[writer].numel() * values[writer].element_size();
+      const auto other_bytes = values[index].numel() * values[index].element_size();
+      TORCH_CHECK(!values[writer].is_alias_of(values[index]) &&
+                    (start <= other ? other - start >= bytes : start - other >= other_bytes),
+                  "backward tail writable storage overlaps another operand");
+    }
+  }
+}
+
+void CheckMatrixShapes(const std::vector<at::Tensor> &inputs, const at::Tensor &dx,
+                       const at::Tensor &gate, const at::Tensor &down) {
+  const auto &dz = inputs[0];
+  const auto &x = inputs[4];
+  const auto &activation = inputs[5];
+  const auto &dv = inputs[6];
+  TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1 && x.dim() == 2 && x.size(0) > 0 &&
+                x.size(0) <= (1 << 20) && x.size(1) >= 16 && x.size(1) <= 32768 && x.size(1) % 16 == 0 &&
+                dz.dim() == 2 && dz.size(0) == x.size(0) && dz.size(1) >= 32 && dz.size(1) <= 65536 &&
+                dz.size(1) % 32 == 0 && dv.sizes() == x.sizes() && dx.sizes() == x.sizes(),
+              "backward tail matrix shapes are invalid");
+  const int64_t inner = dz.size(1) / 2;
+  TORCH_CHECK(activation.sizes() == at::IntArrayRef({x.size(0), inner}) &&
+                gate.dim() == 3 && gate.size(0) > 0 && gate.size(1) == x.size(1) && gate.size(2) == inner * 2 &&
+                down.sizes() == at::IntArrayRef({gate.size(0), inner, x.size(1)}),
+              "backward tail gradient or activation shapes are invalid");
+}
+
+void CheckControls(const std::vector<at::Tensor> &inputs, const at::Tensor &gate,
+                    const at::Tensor &ready, int64_t cores) {
+  TORCH_CHECK(cores >= 1 && cores <= 24 && inputs[2].size(0) >= cores &&
+                ready.sizes() == at::IntArrayRef({cores, gate.size(0), 16}) &&
+                reinterpret_cast<uintptr_t>(ready.data_ptr()) % 64 == 0,
+              "backward tail readiness must cover every cube producer and actual expert");
+  TORCH_CHECK(inputs[1].sizes() == at::IntArrayRef({gate.size(0)}) &&
+                inputs[3].numel() == static_cast<int64_t>(RoutedExpertsGemmConfigBytes()) &&
+                inputs[8].numel() == static_cast<int64_t>(RoutedExpertsGradientConfigBytes()) &&
+                inputs[10].numel() == static_cast<int64_t>(RoutedExpertsGradientConfigBytes()),
+              "backward tail pointer table or tiling extent is invalid");
+}
+
+void BackwardTail(at::TensorList weights, at::TensorList operands, at::Tensor dx,
+                  at::Tensor gate_gradient, at::Tensor down_gradient, at::Tensor ready,
+                  at::Tensor gradient_ready, bool transposed, int64_t cores) {
+  TORCH_CHECK(operands.size() == 12, "backward tail expects twelve prepared read-only operands");
+  std::vector<at::Tensor> inputs(operands.begin(), operands.end());
+  const auto &anchor = inputs[0];
+  for (size_t index = 0; index < inputs.size(); ++index) {
+    const auto dtype = index == 11 ? at::kInt : (index == 1 || index == 2 || index == 7 || index == 9) ? at::kLong :
+                       (index == 3 || index == 8 || index == 10) ? at::kByte : at::kBFloat16;
+    CheckStorage(inputs[index], anchor, dtype);
+  }
+  CheckStorage(dx, anchor, at::kBFloat16);
+  CheckStorage(gate_gradient, anchor, at::kFloat);
+  CheckStorage(down_gradient, anchor, at::kFloat);
+  CheckStorage(ready, anchor, at::kInt);
+  CheckStorage(gradient_ready, anchor, at::kInt);
+  CheckTasks(inputs[2], 5);
+  CheckTasks(inputs[7], 7);
+  CheckTasks(inputs[9], 7);
+  CheckMatrixShapes(inputs, dx, gate_gradient, down_gradient);
+  CheckControls(inputs, gate_gradient, ready, cores);
+  TORCH_CHECK(inputs[11].sizes() == at::IntArrayRef({gate_gradient.size(0)}) &&
+                gradient_ready.sizes() == at::IntArrayRef({cores, 16}) &&
+                reinterpret_cast<uintptr_t>(gradient_ready.data_ptr()) % 64 == 0,
+              "early expert priorities and gradient producer flags have invalid geometry");
+  TORCH_CHECK(weights.size() == static_cast<size_t>(gate_gradient.size(0)), "backward weights miss actual experts");
+  auto retained = inputs;
+  for (const auto &weight : weights) {
+    TORCH_CHECK(weight.sizes() == at::IntArrayRef({anchor.size(1), dx.size(1)}), "invalid dX weight shape");
+    CheckStorage(transposed ? weight.transpose(0, 1) : weight, anchor, at::kBFloat16);
+    retained.push_back(weight);
+  }
+  const auto readers = retained.size();
+  retained.insert(retained.end(), {dx, gate_gradient, down_gradient, ready, gradient_ready});
+  CheckAliases(retained, readers);
+  const c10_npu::NPUGuard guard(anchor.device());
+  const auto stream = c10_npu::getCurrentNPUStream(anchor.device().index());
+  for (const auto &value : retained) {
+    c10_npu::NPUCachingAllocator::recordStream(value.storage().data_ptr(), stream);
+  }
+  at_npu::native::OpCommand::RunOpApi("RoutedExpertsBackwardTail", [=]() -> int {
+    // Retain references captured by the asynchronous command independently of TensorList's caller.
+    (void)retained;
+    return RoutedExpertsBackwardTail(stream.stream(false), inputs[0].data_ptr(), inputs[1].data_ptr(),
+      inputs[2].data_ptr(), dx.data_ptr(), inputs[3].data_ptr(), ready.data_ptr(),
+      inputs[4].data_ptr(), inputs[5].data_ptr(), inputs[6].data_ptr(),
+      inputs[7].data_ptr(), gate_gradient.data_ptr(), inputs[8].data_ptr(),
+      inputs[9].data_ptr(), down_gradient.data_ptr(), inputs[10].data_ptr(), inputs[11].data_ptr(),
+      gradient_ready.data_ptr(),
+      inputs[2].size(0), inputs[7].size(0), inputs[9].size(0), dx.size(1), anchor.size(1) / 2,
+      gate_gradient.size(0), cores, transposed);
+  });
+}
+
+void WaitProducers(const at::Tensor &flags, int64_t watchdog) {
+  TORCH_CHECK(flags.device().type() == c10::DeviceType::PrivateUse1 && flags.dim() == 2 &&
+                flags.size(0) <= 24 && flags.size(1) == 16 && watchdog > 0,
+              "producer wait requires aligned per-core cache lines and a positive watchdog");
+  CheckStorage(flags, flags, at::kInt);
+  const c10_npu::NPUGuard guard(flags.device());
+  const auto stream = c10_npu::getCurrentNPUStream(flags.device().index());
+  c10_npu::NPUCachingAllocator::recordStream(flags.storage().data_ptr(), stream);
+  at_npu::native::OpCommand::RunOpApi("RoutedExpertsWaitProducers", [=]() -> int {
+    return RoutedExpertsWaitProducers(stream.stream(false), flags.data_ptr(), flags.size(0), watchdog);
+  });
+}
+
+}  // namespace
+
+TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
+  m.def("routed_experts_backward_tail(Tensor[] weights, Tensor[] operands, Tensor(a!) dx, "
+        "Tensor(b!) gate_gradient, Tensor(c!) down_gradient, Tensor(d!) ready, Tensor(e!) gradient_ready, "
+        "bool transposed, int cores) -> ()");
+  m.def("routed_experts_wait_producers(Tensor flags, int watchdog=60000000000) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
+  m.impl("routed_experts_backward_tail", &BackwardTail);
+  m.impl("routed_experts_wait_producers", &WaitProducers);
+}
