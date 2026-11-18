@@ -23,14 +23,16 @@ dispatch/collective primitives stay in the generic
 them through the now-public ``build_ep_compute``.
 """
 
+from functools import partial
 from typing import Any, Callable
 
 import torch
 
-from hyper_parallel.core.dtensor.dtensor import DTensor
-
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.distributed._builder.forward_rewriter import _install_bound_forward
+from hyper_parallel.distributed.expert_parallel.moonep import MoonEPExecutor
+from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import checkpoint_route_ids
+from hyper_parallel.distributed.expert_parallel.moonep.runtime import local_tensor
 
 from hyper_parallel.distributed.expert_parallel.experts import (
     SHARED_MERGE_MODES,
@@ -56,24 +58,64 @@ def qwen3moe_ep_compute_fn(
     ep_mesh: Any,
     use_grouped_gemm: bool = False,
     fix_router: bool = False,
+    use_moonep: bool = False,
     use_megamoe: bool = False,
+    moonep_replica_capacity: int | None = None,
+    moonep_prefetch_depth: int = 1,
+    moonep_token_dedup: bool = False,
+    moonep_fwd_ratio: float | None = None,
+    moonep_bwd_ratio: float | None = None,
 ) -> Callable:
-    """Bind ordinary EP or standalone MegaMoE using the original expert parameters.
+    """绑定Qwen3-MoE的普通EP或共享权重生命周期MoonEP。
 
     Args:
-        module: Model block owning the router and expert Parameters.
-        mesh: Model mesh supplied by the adapter infrastructure.
-        tp_mesh: Tensor-parallel mesh managed by the outer layout.
-        cp_mesh: Context-parallel mesh managed by the outer layout.
-        ep_mesh: Expert communication mesh.
-        use_grouped_gemm: Select grouped GEMM in ordinary EP.
-        fix_router: Use balanced destinations only for ordinary EP benchmarks.
-        use_megamoe: Select the standalone native MegaMoE executor.
+        module: 含gate和experts的真实MoE模块，router输出logits、scores和indices。
+        mesh: 通用注入的整网拓扑，本函数无需直接使用。
+        tp_mesh: 通用TP拓扑，由外层参数布局管理。
+        cp_mesh: 通用CP拓扑，由外层序列布局管理。
+        ep_mesh: 实际专家分发域。
+        use_grouped_gemm: 普通EP基线是否采用grouped GEMM。
+        fix_router: 普通EP基线是否采用仅供性能测试的均衡路由。
+        use_moonep: 是否启用MoonEP的动态专家放置。
+        use_megamoe: 单独启用MegaMoE，与非融合MoonEP互斥。
+        moonep_replica_capacity: 不同远程专家数上限；None取E/EP。
+        moonep_prefetch_depth: 仅无 FSDP 路径使用；0按需恢复，1提前恢复。
+        moonep_token_dedup: 是否在 MoonEP token 传输中启用按目标 rank 去重。
+        moonep_fwd_ratio: 前向向量压缩的最大唯一率；None 使用默认值 0.75。
+        moonep_bwd_ratio: 反向 dX 压缩的唯一率界限；None 使用默认值 1.0。
 
     Returns:
-        The local compute callable for the selected expert path.
+        供模型构建器绑定的本地计算函数。
+
+    Example:
+        use_moonep=True、E=128、EP=4时，每卡默认至多32份远程专家，整网共享两个表槽。
     """
     del mesh, tp_mesh, cp_mesh
+    if not isinstance(moonep_token_dedup, bool):
+        raise ValueError("moonep_token_dedup must be a boolean")
+    if moonep_token_dedup and not use_moonep:
+        raise ValueError("moonep_token_dedup requires use_moonep")
+    if use_moonep and use_megamoe:
+        raise ValueError("The nonfused MoonEP executor cannot select standalone MegaMoE")
+    if use_moonep:
+        if fix_router:
+            raise ValueError("Qwen MoonEP不支持仅供性能测试的均衡路由，请使用自然路由")
+        if ep_mesh is None:
+            raise ValueError("Qwen MoonEP需要显式EP mesh")
+        experts = module.experts
+        options = {"token_dedup": moonep_token_dedup,
+                   "forward_ratio": moonep_fwd_ratio, "backward_ratio": moonep_bwd_ratio}
+        options.update(activation="swiglu", prefetch_depth=moonep_prefetch_depth)
+        experts._moonep_executor = MoonEPExecutor(  # pylint: disable=protected-access
+            experts, partial(_qwen_expert_weights, experts),
+            ep_group=ep_mesh.get_group("ep"), ep_size=ep_mesh["ep"].size(),
+            num_experts=module.gate.num_experts, top_k=module.gate.top_k,
+            replica_capacity=moonep_replica_capacity,
+            **options,
+        )
+        _install_bound_forward(experts, _qwen_moonep_experts)
+        _install_bound_forward(module.gate, _qwen_moonep_router)
+        return _qwen_moonep_compute
     if use_megamoe:
         if fix_router:
             raise ValueError("Qwen MegaMoE不支持仅供性能测试的均衡路由")
@@ -87,8 +129,8 @@ def qwen3moe_ep_compute_fn(
             ep_group=ep_mesh.get_group("ep"), create_parameters=False, swiglu_limit=None,
         ))
         _install_bound_forward(experts, _qwen_megamoe_experts)
-        _install_bound_forward(module.gate, _qwen_megamoe_router)
-        return _qwen_megamoe_compute
+        _install_bound_forward(module.gate, _qwen_moonep_router)
+        return _qwen_moonep_compute
     return build_ep_compute(
         module,
         ep_mesh,
@@ -103,12 +145,18 @@ def qwen3moe_ep_compute_fn(
 
 def _qwen_expert_weights(experts: Any) -> tuple[torch.Tensor, torch.Tensor]:
     """读取真实参数的GMM视图；例如已转置的GroupedExperts直接返回[P,H,2I]。"""
-    gate, down = experts.gate_up_proj, experts.down_proj
-    gate = gate.to_local() if isinstance(gate, DTensor) else gate
-    down = down.to_local() if isinstance(down, DTensor) else down
+    gate, down = local_tensor(experts.gate_up_proj), local_tensor(experts.down_proj)
     if not getattr(experts, "is_transposed", False):
         gate, down = gate.transpose(1, 2), down.transpose(1, 2)
     return gate, down
+
+
+def _qwen_moonep_experts(experts: Any, hidden: torch.Tensor, ids: torch.Tensor,
+                         scores: torch.Tensor) -> torch.Tensor:
+    """在experts模块/FSDP边界内计算；例如EP4只持有32个home专家的参数边。"""
+    return experts._moonep_executor(  # pylint: disable=protected-access
+        hidden, ids, scores, expert_weights=_qwen_expert_weights(experts),
+    )
 
 
 def _qwen_megamoe_experts(experts: Any, hidden: torch.Tensor, ids: torch.Tensor,
@@ -119,18 +167,18 @@ def _qwen_megamoe_experts(experts: Any, hidden: torch.Tensor, ids: torch.Tensor,
     )
 
 
-def _qwen_megamoe_router(router: Any, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Preserve the Qwen router formula and differentiable TopK scores."""
+def _qwen_moonep_router(router: Any, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """保留Qwen5.x概率公式，重放只复用离散ID；例如top-k=8仍对8个可微score归一化。"""
     logits = torch.nn.functional.linear(hidden.reshape(-1, router.hidden_dim), router.weight)
     probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
-    indices = probabilities.topk(router.top_k, dim=-1).indices
+    indices = checkpoint_route_ids(router, probabilities, router.top_k)
     scores = probabilities.gather(-1, indices)
     if router.norm_topk_prob:
         scores = scores / scores.sum(-1, keepdim=True)
     return logits, scores.to(logits.dtype), indices
 
 
-def _qwen_megamoe_compute(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+def _qwen_moonep_compute(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
     """路由后调用实际experts子模块；例如[1,S,H]输入最终恢复为同一形状。"""
     indices, scores = MOE_ROUTER_ADAPTERS["qwen3moe"](module, hidden_states)
     return module.experts(hidden_states, indices, scores)

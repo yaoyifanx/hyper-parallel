@@ -71,16 +71,18 @@ class AllReduceCommCtx:
 
 @dataclass
 class AllGatherCommCtx:
-    """Per-parameter all-gather output and asynchronous work."""
+    """Per-parameter all-gather buffers and asynchronous work."""
 
     allgather_output: Optional[torch.Tensor] = None
     allgather_handle: Optional[dist.Work] = None
+    allgather_input: Optional[torch.Tensor] = None
 
 
 class ParameterHookMigrator:
     """Preserve parameter backward hooks across HSDP parameter replacement."""
 
     def __init__(self) -> None:
+        """Initialize the hook registry preserved across parameter replacement."""
         self._orig_param_hooks: List[Callable] = []
         self._saved_hook_ids: set[int] = set()
 
@@ -210,6 +212,7 @@ class HSDPParamV2:
         self.all_reduce_comm_ctx = AllReduceCommCtx()
         self._parameter_hook_migrator._save_backward_hooks(param)
         self._grad = None
+        self._grad_allocation_stream = None
         # Keep reduce-scatter accumulation in reduce_dtype until the final
         # micro-step performs the optional replicate all-reduce.
         self._reduce_partial_output = None
@@ -392,6 +395,11 @@ class HSDPParamV2:
 
     @reduce_partial_output.setter
     def reduce_partial_output(self, value: Optional[torch.Tensor]) -> None:
+        """Replace accumulated contributions.
+
+        Args:
+            value: Partial reduced gradient, or None after consumption.
+        """
         self._reduce_partial_output = value
 
     def reduce_comm_dtype(self, grad: Optional[torch.Tensor] = None) -> torch.dtype:
@@ -423,8 +431,14 @@ class HSDPParamV2:
         """
         if self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None:
             self.reduce_scatter_comm_ctx.reduce_scatter_handle.wait()
+            if self._grad.device.type != "cpu":
+                stream = torch.get_device_module(self.device).current_stream(self.device)
+                if getattr(self, "_grad_allocation_stream", None) != stream:
+                    # A borrowed input or a different wait stream still needs protection.
+                    self._grad.record_stream(stream)
             self._grad.untyped_storage().resize_(0)
             self._grad = None
+            self._grad_allocation_stream = None
             self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
         return self.reduce_scatter_comm_ctx.reduce_scatter_output
 
@@ -432,6 +446,7 @@ class HSDPParamV2:
         """Clear the reduce-scatter output tensor to free memory."""
         self.reduce_scatter_comm_ctx.reduce_scatter_output = None
         self._grad = None
+        self._grad_allocation_stream = None
 
     def all_reduce_output(self) -> Optional[torch.Tensor]:
         """
@@ -572,6 +587,23 @@ class HSDPParamV2:
             spmd_placements[self._spmd_shard_mesh_dim] = fsdp_placement
         self._spmd_placements = tuple(spmd_placements)
 
+    def _init_mesh_sizes(self) -> None:
+        """Resolve shard and replica counts before parameter partitioning."""
+        if isinstance(self.mesh_info, FSDPMeshInfo):
+            self.shard_rank = self.mesh_info.shard_mesh_rank
+            self.shard_world_size = self.mesh_info.shard_mesh_size
+        else:
+            self.shard_rank = 0
+            self.shard_world_size = 1
+        if isinstance(self.mesh_info, DDPMeshInfo):
+            self.replicate_world_size = self.mesh_info.replicate_mesh_size
+        else:
+            self.replicate_world_size = 1
+        self.is_replicate_param = (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and not isinstance(self.mesh_info, HSDPMeshInfo)
+        )
+
     @torch.no_grad()
     def _init_sharded_param(
         self,
@@ -593,21 +625,7 @@ class HSDPParamV2:
             )
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
-
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            self.shard_rank = self.mesh_info.shard_mesh_rank
-            self.shard_world_size = self.mesh_info.shard_mesh_size
-        else:
-            self.shard_rank = 0
-            self.shard_world_size = 1
-        if isinstance(self.mesh_info, DDPMeshInfo):
-            self.replicate_world_size = self.mesh_info.replicate_mesh_size
-        else:
-            self.replicate_world_size = 1
-        self.is_replicate_param = (
-            isinstance(self.mesh_info, DDPMeshInfo)
-            and not isinstance(self.mesh_info, HSDPMeshInfo)
-        )
+        self._init_mesh_sizes()
 
         self._init_shard_placements(
             param_data,
@@ -684,7 +702,7 @@ class HSDPParamV2:
         world_size: int,
         device: torch.device,
         force_recreate: bool = False,
-    ):
+    ) -> None:
         """
         Allocate buffers that hold unsharded parameter data.
 
@@ -1079,6 +1097,7 @@ class HSDPParamV2:
         )
         self.alloc_unsharded_param_buffers()
 
+        self.allgather_comm_ctx.allgather_input = all_gather_input
         self.allgather_comm_ctx.allgather_output = self.unsharded_param_buffers[0]
         if self.hsdp_placement.dim != 0:
             # Non-dim-0 sharding uses an extra all-gather buffer before
@@ -1102,16 +1121,9 @@ class HSDPParamV2:
 
 
     def unshard(self, async_op: bool = False) -> None:
-        """Start gathering the full parameter when no gather is already pending.
-
-        Args:
-            async_op: Whether to launch the all-gather asynchronously.
-        """
-        if self.allgather_comm_ctx.allgather_handle is not None:
-            # Already triggered by HSDPState.prefetch(), so return directly.
-            return  # no-op
-        self._get_unsharded_param_data(async_op=async_op)
-
+        """Submit parameter all-gather unless a prefetch is already in flight."""
+        if self.allgather_comm_ctx.allgather_handle is None:
+            self._get_unsharded_param_data(async_op=async_op)
 
     def wait_for_unshard(self) -> None:
         """Wait for the parameter all-gather and expose the unsharded parameter."""
@@ -1120,6 +1132,18 @@ class HSDPParamV2:
         if self.allgather_comm_ctx.allgather_handle is not None:
             self.allgather_comm_ctx.allgather_handle.wait()
             self.allgather_comm_ctx.allgather_handle = None
+
+        all_gather_input = self.allgather_comm_ctx.allgather_input
+        if all_gather_input is not None and self.device.type != "cpu":
+            # A prefetched gather may be waited on a different stream. Its input
+            # must survive backend wait cleanup, which may release saved tensors.
+            # Record afterwards so that cleanup cannot erase this dependency.
+            stream = torch.get_device_module(self.device).current_stream(self.device)
+            all_gather_input.record_stream(stream)
+            self.unsharded_param_buffers[0].record_stream(stream)
+            if self.allgather_comm_ctx.allgather_output is not None:
+                self.allgather_comm_ctx.allgather_output.record_stream(stream)
+        self.allgather_comm_ctx.allgather_input = None
 
         self.init_unsharded_param()
         self.to_unsharded()
@@ -1149,19 +1173,23 @@ class HSDPParamV2:
                           The buffer must have ``padded_sharded_param_size.numel()`` elements
                           and the reduction dtype.
         """
+        self._grad_allocation_stream = None
         if self.unsharded_accumulated_grad is not None:
             self._grad = self.unsharded_accumulated_grad_data
             self.unsharded_accumulated_grad = None
         else:
             self._grad = self.unsharded_grad_data
             self.unsharded_param.grad = None
-        self._grad = self._grad.to(self.reduce_comm_dtype(self._grad))
+        reduce_dtype = self.reduce_comm_dtype(self._grad)
+        owns_input = self._grad.dtype != reduce_dtype
+        self._grad = self._grad.to(reduce_dtype)
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:
             self._grad = self._grad.view(-1)
         elif shard_dim != 0:
             grad_chunks = torch.chunk(self._grad, self.shard_world_size, dim=shard_dim)
             self._grad = torch.cat(grad_chunks, dim=0).contiguous().view(-1)
+            owns_input = True
             grad_chunks = None
         else:
             padded_unsharded_dim0 = self.padded_sharded_param_size[0] * self.shard_world_size
@@ -1170,6 +1198,7 @@ class HSDPParamV2:
                 padded_grad = self._grad.new_zeros(padded_unsharded_size)
                 padded_grad.narrow(0, 0, self._grad.size(0)).copy_(self._grad)
                 self._grad = padded_grad
+                owns_input = True
             self._grad = self._grad.view(-1)
         apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)
 
@@ -1203,6 +1232,8 @@ class HSDPParamV2:
                 dtype=self._grad.dtype,
                 device=self._grad.device,
             )
+        if owns_input and self._grad.device.type != "cpu":
+            self._grad_allocation_stream = torch.get_device_module(self.device).current_stream(self.device)
         # Execute reduce_scatter_tensor
         self.reduce_scatter_comm_ctx.reduce_scatter_handle = dist.reduce_scatter_tensor(
             self.reduce_scatter_comm_ctx.reduce_scatter_output,
@@ -1213,6 +1244,7 @@ class HSDPParamV2:
         )
         if not async_op:
             self._grad = None
+            self._grad_allocation_stream = None
 
     def all_reduce_grad(
         self,
