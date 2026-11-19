@@ -391,6 +391,8 @@ class HSDPStateV2:
                     self,
                     hsdp_param,
                 )
+                if self.reduction_pipeline.reduce_input_pool.budget_bytes:
+                    hsdp_param.reduce_input_pool = self.reduction_pipeline.reduce_input_pool
                 hsdp_param.reduce_scatter_grad(
                     reduce_op=self.reduce_op_type,
                 )
@@ -419,6 +421,8 @@ class HSDPStateV2:
             )
             for idx, hsdp_param in enumerate(hsdp_params):
                 buffer_view = group.get_param_buffer_view(idx)
+                if self.reduction_pipeline.reduce_input_pool.budget_bytes:
+                    hsdp_param.reduce_input_pool = self.reduction_pipeline.reduce_input_pool
                 hsdp_param.reduce_scatter_grad(
                     reduce_op=self.reduce_op_type,
                     output_buffer=buffer_view,

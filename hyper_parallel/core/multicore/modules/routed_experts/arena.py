@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 from math import prod
+import os
 from threading import RLock
 from typing import Any
 
@@ -57,12 +58,42 @@ class PhaseArena:
         self._pending: deque[Any] = deque()
         self._closed = False
         self._lock = RLock()
+        self.budget_bytes = int(os.environ.get("HP_MOONEP_ARENA_BUDGET_BYTES", "0"))
+        self.max_pending_phases = int(os.environ.get("HP_MOONEP_MAX_PENDING_PHASES", str(_MAX_PENDING_PHASES)))
+        if self.budget_bytes < 0 or self.max_pending_phases < 1:
+            raise ValueError("arena budget must be nonnegative and pending phase limit positive")
+        self.growth_count = 0
+        self.capacity_growth_count = 0
+        self.restoration_count = 0
+        self.peak_growth_bytes = 0
+        self._requests = {}
+        self._retired_growth = deque()
 
     @property
     def reserved_bytes(self) -> int:
         """Return retained region bytes, excluding replaced in-flight storage."""
         with self._lock:
             return sum(value.numel() * value.element_size() for value in self._regions.values())
+
+    def memory_snapshot(self) -> dict:
+        """Describe retained storage and last valid extents without synchronizing NPU.
+
+        The byte budget covers this arena, including old/new region coexistence
+        during growth. FSDP, saved activations and external SHMEM are separate owners.
+        """
+        with self._lock:
+            self._reap_growth()
+            return {"reserved_bytes": self.reserved_bytes, "budget_bytes": self.budget_bytes,
+                    "retired_growth_bytes": sum(size for _event, size in self._retired_growth),
+                    "growth_count": self.growth_count, "capacity_growth_count": self.capacity_growth_count,
+                    "restoration_count": self.restoration_count, "peak_growth_bytes": self.peak_growth_bytes,
+                    "pending_phases": len(self._pending),
+                    "high_water_capacities": {name: {"dtype": str(dtype), "bytes": elements * dtype.itemsize}
+                                              for name, (dtype, elements) in self._capacities.items()}, "regions": {
+                        name: {"dtype": str(value.dtype), "capacity_bytes": value.numel() * value.element_size(),
+                               "valid_bytes": self._requests.get(name, 0),
+                               "storage_id": value.untyped_storage().data_ptr()}
+                        for name, value in self._regions.items()}}
 
     def begin(self) -> object:
         """Wait for an available in-flight phase slot, then return its release token."""
@@ -71,7 +102,8 @@ class PhaseArena:
             if self._active is not None:
                 raise RuntimeError("temporary arena already has an active phase")
             self._check_stream(bind=True)
-            if len(self._pending) >= _MAX_PENDING_PHASES:
+            self._reap_growth()
+            if len(self._pending) >= self.max_pending_phases:
                 self._wait_oldest()
             self._active = object()
             self._used.clear()
@@ -101,11 +133,26 @@ class PhaseArena:
             if previous is None or previous.numel() < elements:
                 rounded_bytes = ((max(elements, capacity) * dtype.itemsize + _QUANTUM_BYTES - 1)
                                  // _QUANTUM_BYTES * _QUANTUM_BYTES)
+                self._reap_growth()
+                growth_bytes = self.reserved_bytes + rounded_bytes + sum(size for _event, size in self._retired_growth)
+                if self.budget_bytes and growth_bytes > self.budget_bytes:
+                    raise RuntimeError("temporary arena growth exceeds the configured byte budget")
                 replacement = torch.empty(rounded_bytes // dtype.itemsize, dtype=dtype, device=self.device)
+                if previous is not None and self.device.type != "cpu":
+                    retired = getattr(torch, self.device.type).Event()
+                    retired.record(self._bound_stream)
+                    self._retired_growth.append((retired, previous.numel() * previous.element_size()))
+                self.growth_count += 1
+                if replacement.numel() > capacity:
+                    self.capacity_growth_count += 1
+                elif previous is None and capacity:
+                    self.restoration_count += 1
+                self.peak_growth_bytes = max(self.peak_growth_bytes, growth_bytes)
                 self._regions[name] = replacement
                 self._capacities[name] = dtype, replacement.numel()
             result = self._regions[name][:elements].view(shape)
             self._used.add(name)
+            self._requests[name] = elements * dtype.itemsize
             return result
 
     def end(self, token: object) -> None:
@@ -122,7 +169,7 @@ class PhaseArena:
             self._active = None
             self._used.clear()
 
-    def release_regions(self, names: Sequence[str]) -> int:
+    def release_regions(self, names: Sequence[str], *, keep_budget_bytes: int = 0) -> int:
         """Drop selected idle regions while remembering their dtype and capacity.
 
         Queued commands and allocator stream records protect outstanding device
@@ -142,8 +189,20 @@ class PhaseArena:
             if (not isinstance(names, Sequence) or isinstance(names, str)
                     or any(not isinstance(name, str) or not name for name in names)):
                 raise ValueError("temporary region release requires a sequence of nonempty names")
+            if isinstance(keep_budget_bytes, bool) or not isinstance(keep_budget_bytes, int) or keep_budget_bytes < 0:
+                raise ValueError("retained region budget must be a nonnegative integer")
+            keep = set()
+            for name in sorted(names, key=lambda key: self._regions[key].numel() * self._regions[key].element_size()
+                               if key in self._regions else 0, reverse=True):
+                region = self._regions.get(name)
+                size = 0 if region is None else region.numel() * region.element_size()
+                if size and size <= keep_budget_bytes:
+                    keep.add(name)
+                    keep_budget_bytes -= size
             released = 0
             for name in names:
+                if name in keep:
+                    continue
                 region = self._regions.pop(name, None)
                 if region is not None:
                     released += region.numel() * region.element_size()
@@ -161,6 +220,7 @@ class PhaseArena:
             while self._pending:
                 self._wait_oldest()
             self._regions.clear()
+            self._retired_growth.clear()
             self._capacities.clear()
             self._used.clear()
             self._closed = True
@@ -168,6 +228,11 @@ class PhaseArena:
     def _check_open(self) -> None:
         if self._closed:
             raise RuntimeError("temporary arena is closed")
+
+    def _reap_growth(self) -> None:
+        """Forget retired allocation accounting only after its queued users finish."""
+        while self._retired_growth and self._retired_growth[0][0].query():
+            self._retired_growth.popleft()
 
     def _wait_oldest(self) -> None:
         completion = self._pending[0]

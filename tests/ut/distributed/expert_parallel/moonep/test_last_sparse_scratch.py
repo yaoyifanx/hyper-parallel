@@ -29,7 +29,7 @@ from tests.common.mark_utils import arg_mark
 
 _BACKWARD = ("selections", "incoming", "down_gradient", "gate_gradient", "activation", "backward_activation")
 _FORWARD = ("project", "forward_activation")
-_RETIRED = (*_BACKWARD, *_FORWARD)
+_RETIRED = (*_BACKWARD, *_FORWARD, "replica_dW_0", "replica_dW_1")
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")

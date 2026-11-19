@@ -47,6 +47,7 @@ def _make_scheduler_stub() -> HSDPSchedulerV2:
     scheduler.scheduler_ctx = HSDPSchedulerContext()
     scheduler._param_grad_gate = False
     scheduler._pre_reduce_hook = None
+    scheduler.early_release_rs_input = False
     scheduler.device = torch.device("cpu")
     scheduler._param_grad_expected = set()
     scheduler._param_grad_ready = set()
@@ -657,8 +658,8 @@ class TestRootBackwardCallback(unittest.TestCase):
                     param.free_unsharded_param.assert_called_once_with()
                 scheduler._backward_hook.assert_called_once_with()
                 child._backward_hook.assert_called_once_with()
-                scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
-                scheduler._finalize_per_param_reductions.assert_called_once_with()
+                scheduler._finalize_comm_fusion_reductions.assert_called_once_with(scheduler.scheduler_ctx)
+                scheduler._finalize_per_param_reductions.assert_called_once_with(child.hsdp_state)
                 scheduler.launch_tp_replicate_reduce_and_apply.assert_called_once_with()
 
     def test_unused_prefetch_wait_failure_preserves_work(self) -> None:
@@ -920,7 +921,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         hook = HSDPSchedulerV2._forward_pre_hook
 
         self.assertEqual(hook.__name__, "_forward_pre_hook")
-        self.assertEqual(hook.__wrapped__.__name__, "_forward_pre_hook")
+        self.assertEqual(getattr(hook, "__wrapped__").__name__, "_forward_pre_hook")
 
     def test_fsdp_runtime_hooks_are_dynamo_disabled(self):
         """All FSDP runtime scheduler entries should carry the native decorator."""
@@ -1045,13 +1046,15 @@ class TestGradientReductionStream(unittest.TestCase):
         scheduler = _make_scheduler_stub()
         scheduler.device = torch.device("npu") if hasattr(torch, "npu") else torch.device("cuda")
         gradient, accumulation, weight = (MagicMock(spec=torch.Tensor) for _ in range(3))
-        parameter = SimpleNamespace(unsharded_grad_data=gradient, unsharded_accumulated_grad_data=accumulation,
-                                    unsharded_param_buffers=[weight])
+        parameter = SimpleNamespace(
+            unsharded_grad_data=gradient, unsharded_accumulated_grad_data=accumulation,
+            unsharded_param_buffers=[weight], allgather_comm_ctx=AllGatherCommCtx())
         state = object.__new__(HSDPStateV2)
         state.hsdp_params, state.module_name, state.device = [parameter, SimpleNamespace(
-            unsharded_param_buffers=[])], "expert", scheduler.device
+            unsharded_param_buffers=[], allgather_comm_ctx=AllGatherCommCtx())], "expert", scheduler.device
+        state.is_shard = True
         state.scheduler_ctx = scheduler.scheduler_ctx
-        state.param_group = SimpleNamespace(comm_ctx=None)
+        state.param_group = SimpleNamespace(comm_ctx=None, all_gather_buckets=[])
         state.post_backward = lambda: events.append(("reduce", active[0]))
         scheduler.hsdp_state = state
         scheduler._fsdp_group_post_pending = None

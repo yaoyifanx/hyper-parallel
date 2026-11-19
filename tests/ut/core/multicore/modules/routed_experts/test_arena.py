@@ -48,6 +48,40 @@ class TestPhaseArena(unittest.TestCase):
         arena.close()
         self.assertEqual(arena.reserved_bytes, 0)
 
+    def test_budget_rejects_growth_without_losing_old_region(self):
+        """Admission counts old/new coexistence and retains valid old storage on failure."""
+        arena = PhaseArena(torch.device("cpu"))
+        arena.budget_bytes = 2 * _QUANTUM
+        token = arena.begin()
+        original = arena.allocate("region", (2,), torch.float32)
+        arena.end(token)
+        token = arena.begin()
+        with self.assertRaisesRegex(RuntimeError, "byte budget"):
+            arena.allocate("region", (_QUANTUM // 4 + 1,), torch.float32)
+        retained = arena.allocate("region", (2,), torch.float32)
+        self.assertEqual(original.data_ptr(), retained.data_ptr())
+        arena.end(token)
+
+    def test_bounded_retention_and_restoration_accounting(self):
+        """Distinguish true capacity growth from rebuilding intentionally retired scratch."""
+        arena = PhaseArena(torch.device("cpu"))
+        token = arena.begin()
+        first = arena.allocate("first", (2,), torch.float32)
+        first.fill_(19)
+        arena.allocate("second", (2,), torch.float32)
+        arena.end(token)
+        released = arena.release_regions(("first", "second"), keep_budget_bytes=_QUANTUM)
+        self.assertEqual(released, _QUANTUM)
+        self.assertEqual(arena.reserved_bytes, _QUANTUM)
+        token = arena.begin()
+        arena.allocate("first", (2,), torch.float32)
+        arena.allocate("second", (2,), torch.float32)
+        arena.end(token)
+        snapshot = arena.memory_snapshot()
+        self.assertEqual(snapshot["capacity_growth_count"], 2)
+        self.assertEqual(snapshot["restoration_count"], 1)
+        torch.testing.assert_close(first, torch.full_like(first, 19))
+
     def test_next_phase_reuses_high_water_storage(self):
         """Shape changes below the retained capacity keep the same allocation."""
         arena = PhaseArena(torch.device("cpu"))

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from typing import Any
 
 import torch
@@ -58,10 +59,12 @@ class MoonEPAllGatherExtension:
                 return
             self.executor.prepare_forward(key, *values)
         else:
+            if os.environ.get("HP_MOONEP_REPLICA_PREFETCH", "1") != "1":
+                return
             key = self.runtime.prefetch_key(self.executor)
         if key is None or key in self.runtime.weight_leases:
             return
-        with torch.profiler.record_function("moonep::fsdp_ep_prepare"):
+        with torch.profiler.record_function(f"moonep::fsdp_ep_prepare::layer={self.executor.layer}::key={key}"):
             self.runtime.prepare(key)
         statistic = "fsdp_ep_demand_preparations" if pending is not None else "fsdp_ep_prefetches"
         self.runtime.statistics[statistic] += 1
@@ -141,6 +144,51 @@ class MoonEPGradientExtension:
         self._parameter_layout = tuple(layouts)
         return self._parameter_layout
 
+    def uses_accumulated_grad(self, state: Any) -> bool:
+        """Honor explicit executor policy or the model's fused-wgrad installation.
+
+        The owner marker is attached by VeOmni only when its gradient accumulation
+        fusion switch is enabled. An environment override supports isolated ablations.
+        """
+        override = os.environ.get("HP_MOONEP_FUSED_WGRAD")
+        enabled = getattr(self.executor, "gradient_accumulation_fusion", None)
+        if override is not None:
+            enabled = override == "1"
+        if enabled is False:
+            return False
+        marked = all(getattr(parameter.unsharded_param, "_veomni_fused_wgrad_owner", None) is parameter
+                     for parameter, _ in self._layouts(state))
+        if enabled is True and not marked:
+            if any(parameter.reduce_comm_dtype() != torch.float32 for parameter, _ in self._layouts(state)):
+                raise ValueError("MoonEP fused wgrad requires FP32 FSDP reduction")
+            return True
+        return marked
+
+    @torch.no_grad()
+    def accumulation_buffers(self, state: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Borrow real FSDP FP32 accumulators without resetting earlier microsteps."""
+        buffers = []
+        for parameter, _ in self._layouts(state):
+            if parameter.reduce_comm_dtype() != torch.float32:
+                raise ValueError("MoonEP fused wgrad requires FP32 FSDP reduction")
+            local = self._local(parameter.unsharded_param)
+            if parameter.unsharded_accumulated_grad is None:
+                parameter.unsharded_accumulated_grad = torch.zeros_like(local, dtype=torch.float32)
+            target = parameter.unsharded_accumulated_grad_data
+            if target.dtype != torch.float32 or target.shape != local.shape or not target.is_contiguous():
+                raise ValueError("MoonEP accumulation requires contiguous FP32 parameter gradient buffers")
+            buffers.append(target)
+        return tuple(buffers)
+
+    def notify_accumulated(self, scheduler: Any) -> None:
+        """Notify the FSDP readiness gate after side-effect writes are enqueued.
+
+        Returning None to autograd must neither allocate dummy zero gradients nor
+        leave the parameter gate waiting for AccumulateGrad hooks that cannot run.
+        """
+        for parameter, _ in self._layouts(scheduler.hsdp_state):
+            scheduler._on_param_grad_ready(parameter.unsharded_param)  # pylint: disable=protected-access
+
     @torch.no_grad()
     def start(self, gate_up: torch.Tensor, down: torch.Tensor,
               plan: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,11 +224,24 @@ class MoonEPGradientExtension:
                 stream = torch.get_device_module(packet.receive_buffer.device).current_stream()
                 packet.plan.send_ids.record_stream(stream)
             for (parameter, transposed), contribution in zip(layouts, (remote_gate_up, remote_down)):
-                if parameter.unsharded_param.grad is None:
-                    raise RuntimeError("FSDP 参数梯度尚未累积，不能归并专家副本梯度")
-                target = self._local(parameter.unsharded_param.grad)
-                if transposed:
-                    contribution = contribution.transpose(1, 2).contiguous()
-                target.index_add_(0, packet.plan.send_ids, contribution)
+                accumulated = self.uses_accumulated_grad(state)
+                if accumulated:
+                    target = parameter.unsharded_accumulated_grad_data
+                    if target is None:
+                        raise RuntimeError("MoonEP accumulated gradient is missing before replica merge")
+                    if transposed:
+                        contribution = contribution.transpose(1, 2)
+                    if (len(packet.plan.send_slots) != contribution.shape[0]
+                            or any(slot < 0 or slot >= target.shape[0] for slot in packet.plan.send_slots)):
+                        raise RuntimeError("replica gradient return has an invalid host owner mapping")
+                    for index, slot in enumerate(packet.plan.send_slots):
+                        target[slot].add_(contribution[index])
+                else:
+                    if parameter.unsharded_param.grad is None:
+                        raise RuntimeError("FSDP parameter gradient is missing before replica merge")
+                    target = self._local(parameter.unsharded_param.grad)
+                    if transposed:
+                        contribution = contribution.transpose(1, 2).contiguous()
+                    target.index_add_(0, packet.plan.send_ids, contribution)
             self.runtime.statistics["gradient_waits"] += 1
         self.pending.clear()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import os
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -32,7 +33,9 @@ from hyper_parallel.core.multicore.modules.routed_experts.transport import trans
 from hyper_parallel.core.multicore.modules.routed_experts.workspace import RingSpec, RingWorkspace
 from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import is_replaying
 from hyper_parallel.distributed.expert_parallel.moonep.device_planning import inverse_permutation
-from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import register_fsdp_extensions
+from hyper_parallel.distributed.expert_parallel.moonep.fsdp_hooks import (
+    MoonEPGradientExtension, register_fsdp_extensions,
+)
 from hyper_parallel.distributed.expert_parallel.moonep.lifecycle import ExecutionKey, MoonEPLifecycle
 from hyper_parallel.distributed.expert_parallel.moonep.streams import communication_stream
 from hyper_parallel.distributed.expert_parallel.moonep.fused.autograd import SparseExpertFunction
@@ -95,6 +98,11 @@ class SparseMoonEPRuntime(MoonEPLifecycle):
         self.home_geometry = None
         self.home_device = None
         self.weight_slots = 2
+        self.direct_grad_send = os.environ.get("HP_MOONEP_DIRECT_GRAD_SEND", "1") == "1"
+        self.separate_token_stream = os.environ.get("HP_MOONEP_SEPARATE_TOKEN_STREAM", "0") == "1"
+        self.retained_scratch_budget = int(os.environ.get("HP_MOONEP_RETAIN_ARENA_BYTES", "0"))
+        if self.retained_scratch_budget < 0:
+            raise ValueError("retained scratch budget must be nonnegative")
         for executor in executors:
             scheduler = getattr(executor.owner, "hsdp_scheduler", None)
             if scheduler is not None:
@@ -102,6 +110,7 @@ class SparseMoonEPRuntime(MoonEPLifecycle):
                     len(getattr(scheduler, "forward_prefetch_cells", ())),
                     len(getattr(scheduler, "backward_prefetch_cells", ()))))
                 register_fsdp_extensions(executor, self)
+                executor.gradient_extension = MoonEPGradientExtension(executor, self)
 
     @staticmethod
     def _validate_root_topology(root: Any, group_size: int, configuration: tuple) -> None:
@@ -174,7 +183,12 @@ class SparseMoonEPRuntime(MoonEPLifecycle):
         manifest = (executor.ranks, executor.experts, executor.top_k, executor.replica_capacity,
                     gate_up_shape, down_shape, gate_up.stride(), down.stride(), len(self.executors),
                     executor.token_dedup, executor.forward_ratio, executor.backward_ratio,
-                    executor.swiglu_limit, self.weight_slots, getattr(executor, 'dedup_protocol', 'selection_v1'))
+                    executor.swiglu_limit, self.weight_slots, getattr(executor, 'dedup_protocol', 'selection_v1'),
+                    os.environ.get("HP_MOONEP_COMPACT_WEIGHTS", "0"),
+                    getattr(executor, "gradient_accumulation_fusion", None),
+                    os.environ.get("HP_MOONEP_FUSED_WGRAD"), os.environ.get("HP_MOONEP_REPLICA_PREFETCH", "1"),
+                    os.environ.get("HP_MOONEP_DIRECT_GRAD_SEND", "1"),
+                    os.environ.get("HP_MOONEP_SEPARATE_TOKEN_STREAM", "0"))
         validate_parameter_ownership(tuple(peer.owner for peer in self.executors))
         return manifest
 
@@ -228,7 +242,8 @@ class SparseMoonEPRuntime(MoonEPLifecycle):
         control_groups = self.groups
         stream = communication_stream(executor.group, gate_up.device)
         self.workspace = RingWorkspace(RingSpec(executor.ranks, gate_up.shape[1]), executor.group,
-                                       control_group=control_groups[0], stream=stream)
+                                       control_group=control_groups[0],
+                                       stream=None if self.separate_token_stream else stream)
         self.arena = PhaseArena(gate_up.device)
         self.weight_domain = TransferDomain(executor.group, executor.rank, gate_up.device,
                                             control_group=control_groups[1],
@@ -273,8 +288,13 @@ class SparseMoonEPRuntime(MoonEPLifecycle):
         if self.arena is None:
             return
         regions = ("selections", "incoming", "down_gradient", "gate_gradient",
-                   "activation", "backward_activation", "project", "forward_activation")
-        self.arena.release_regions(regions)
+                   "activation", "backward_activation", "project", "forward_activation",
+                   "replica_dW_0", "replica_dW_1")
+        budget = getattr(self, "retained_scratch_budget", 0)
+        if budget:
+            self.arena.release_regions(regions, keep_budget_bytes=budget)
+        else:
+            self.arena.release_regions(regions)
         self.statistics["scratch_reserved_bytes"] = self.arena.reserved_bytes
 
     def forward_header(self, executor: Any, key: ExecutionKey, failed: bool) -> tuple[int, ...]:
@@ -570,10 +590,12 @@ class SparseMoonEPExecutor:
                  forward_ratio: float | None = None,
                  backward_ratio: float | None = None,
                  dedup_protocol: str = 'selection_v1',
-                 swiglu_limit: float | None = None) -> None:
+                 swiglu_limit: float | None = None,
+                 gradient_accumulation_fusion: bool | None = None) -> None:
         """Bind the existing expert owner without registering any replacement parameters."""
         if ep_size < 1 or num_experts % ep_size or not 0 < top_k <= num_experts:
             raise ValueError("invalid expert partition or top-k")
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.owner, self.read_weights, self.group = owner, read_weights, ep_group
         self.ranks, self.experts, self.top_k = ep_size, num_experts, top_k
         if not isinstance(token_dedup, bool):
@@ -645,6 +667,13 @@ class SparseMoonEPExecutor:
             # The existing count-header admission already rejects missing geometry on every rank.
             gate_up, down = tuple(self.shapes)
             role_sizes = (("gate", gate_up[0] * gate_up[1]), ("down", down[0] * down[1]))
+            self.runtime.statistics["max_selection_rows"] = max(
+                self.runtime.statistics["max_selection_rows"], selections)
+            self.runtime.statistics["max_received_rows"] = max(
+                self.runtime.statistics["max_received_rows"], route.received_rows)
+            self.runtime.statistics["remote_experts_max"] = max(
+                self.runtime.statistics["remote_experts_max"],
+                sum(expert // self.home_count != self.rank for expert in route.active_experts))
             self.runtime.statistics["plans"] += 1
             self.runtime.statistics["planner_fallbacks"] += int(fallback)
             source_rows = int(source.sum(axis=1).max())

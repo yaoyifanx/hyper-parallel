@@ -172,7 +172,8 @@ class TestSparseAdmission(unittest.TestCase):
                 self.runtime.complete(key)
         self.assertEqual(arena.release_regions.call_count, 2)
         arena.release_regions.assert_called_with(("selections", "incoming", "down_gradient", "gate_gradient",
-                                                  "activation", "backward_activation", "project", "forward_activation"))
+                                                  "activation", "backward_activation", "project", "forward_activation",
+                                                  "replica_dW_0", "replica_dW_1"))
         self.runtime.finish_step()
         self.assertEqual(arena.release_regions.call_count, 3)
         self._forward_trace()

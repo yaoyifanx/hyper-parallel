@@ -145,6 +145,82 @@ void BackwardTail(at::TensorList weights, at::TensorList operands, at::Tensor dx
   });
 }
 
+void BackwardAccumulate(at::TensorList weights, at::TensorList operands, at::Tensor dx,
+                        at::TensorList gate_outputs, at::TensorList down_outputs, at::Tensor ready,
+                        at::Tensor gradient_ready, bool transposed, bool gate_transposed,
+                        bool down_transposed, int64_t cores) {
+  TORCH_CHECK(operands.size() == 14 && !gate_outputs.empty() && gate_outputs.size() == down_outputs.size(),
+              "mapped backward expects fourteen operands and gate/down destinations");
+  std::vector<at::Tensor> inputs(operands.begin(), operands.end());
+  const auto &anchor = inputs[0];
+  for (size_t index = 0; index < inputs.size(); ++index) {
+    const auto dtype = index == 11 ? at::kInt : (index == 1 || index == 2 || index == 7 || index == 9 || index >= 12)
+        ? at::kLong : (index == 3 || index == 8 || index == 10) ? at::kByte : at::kBFloat16;
+    CheckStorage(inputs[index], anchor, dtype);
+  }
+  CheckStorage(dx, anchor, at::kBFloat16);
+  CheckStorage(ready, anchor, at::kInt);
+  CheckStorage(gradient_ready, anchor, at::kInt);
+  CheckTasks(inputs[2], 5);
+  CheckTasks(inputs[7], 7);
+  CheckTasks(inputs[9], 7);
+  const int64_t experts = gate_outputs.size(), hidden = dx.size(1), inner = anchor.size(1) / 2;
+  const auto meta = at::TensorOptions().device(at::kMeta).dtype(at::kFloat);
+  const auto gate_shape = at::empty({experts, hidden, inner * 2}, meta);
+  CheckMatrixShapes(inputs, dx, gate_shape, at::empty({experts, inner, hidden}, meta));
+  CheckControls(inputs, gate_shape, ready, cores);
+  TORCH_CHECK(weights.size() == gate_outputs.size() && inputs[11].numel() == experts &&
+                  inputs[12].numel() == experts && inputs[13].numel() == experts &&
+                  gradient_ready.sizes() == at::IntArrayRef({cores, 16}), "mapped backward metadata is invalid");
+  auto retained = inputs;
+  for (const auto &weight : weights) {
+    TORCH_CHECK(weight.sizes() == at::IntArrayRef({inner * 2, hidden}), "invalid mapped dX weight");
+    CheckStorage(transposed ? weight.transpose(0, 1) : weight, anchor, at::kBFloat16);
+    retained.push_back(weight);
+  }
+  const auto readers = retained.size();
+  for (size_t role = 0; role < 2; ++role) {
+    const auto outputs = role ? down_outputs : gate_outputs;
+    const auto transpose = role ? down_transposed : gate_transposed;
+    const int64_t rows = role ? inner : hidden, columns = role ? hidden : inner * 2;
+    for (const auto &output : outputs) {
+      CheckStorage(output, anchor, at::kFloat);
+      TORCH_CHECK(output.sizes() == at::IntArrayRef({transpose ? columns : rows, transpose ? rows : columns}),
+                  "mapped dW must use contiguous physical parameter layout");
+      retained.push_back(output);
+    }
+  }
+  retained.insert(retained.end(), {dx, ready, gradient_ready});
+  // Separate experts may share a parameter storage; disjoint physical ranges
+  // are legal, whereas overlapping writers or input aliases are forbidden.
+  for (size_t writer = readers; writer < retained.size(); ++writer) {
+    const auto start = reinterpret_cast<uintptr_t>(retained[writer].data_ptr());
+    const auto size = retained[writer].numel() * retained[writer].element_size();
+    for (size_t index = 0; index < retained.size(); ++index) {
+      if (writer == index || !retained[index].numel()) { continue; }
+      const auto other = reinterpret_cast<uintptr_t>(retained[index].data_ptr());
+      const auto bytes = retained[index].numel() * retained[index].element_size();
+      TORCH_CHECK(start <= other ? other - start >= size : start - other >= bytes,
+                  "mapped dW writers must not overlap another operand");
+    }
+  }
+  const c10_npu::NPUGuard guard(anchor.device());
+  const auto stream = c10_npu::getCurrentNPUStream(anchor.device().index());
+  for (const auto &value : retained) {
+    c10_npu::NPUCachingAllocator::recordStream(value.storage().data_ptr(), stream);
+  }
+  at_npu::native::OpCommand::RunOpApi("RoutedExpertsBackwardAccumulate", [=]() -> int {
+    (void)retained;
+    return RoutedExpertsBackwardAccumulate(stream.stream(false), inputs[0].data_ptr(), inputs[1].data_ptr(),
+      inputs[2].data_ptr(), dx.data_ptr(), inputs[3].data_ptr(), ready.data_ptr(),
+      inputs[4].data_ptr(), inputs[5].data_ptr(), inputs[6].data_ptr(),
+      inputs[7].data_ptr(), inputs[12].data_ptr(), inputs[8].data_ptr(),
+      inputs[9].data_ptr(), inputs[13].data_ptr(), inputs[10].data_ptr(), inputs[11].data_ptr(),
+      gradient_ready.data_ptr(), inputs[2].size(0), inputs[7].size(0), inputs[9].size(0),
+      hidden, inner, experts, cores, transposed, gate_transposed, down_transposed);
+  });
+}
+
 void WaitProducers(const at::Tensor &flags, int64_t watchdog) {
   TORCH_CHECK(flags.device().type() == c10::DeviceType::PrivateUse1 && flags.dim() == 2 &&
                 flags.size(0) <= 24 && flags.size(1) == 16 && watchdog > 0,
@@ -164,10 +240,14 @@ TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
   m.def("routed_experts_backward_tail(Tensor[] weights, Tensor[] operands, Tensor(a!) dx, "
         "Tensor(b!) gate_gradient, Tensor(c!) down_gradient, Tensor(d!) ready, Tensor(e!) gradient_ready, "
         "bool transposed, int cores) -> ()");
+  m.def("routed_experts_backward_accumulate(Tensor[] weights, Tensor[] operands, Tensor(a!) dx, "
+        "Tensor(b!)[] gate_outputs, Tensor(c!)[] down_outputs, Tensor(d!) ready, Tensor(e!) gradient_ready, "
+        "bool transposed, bool gate_transposed, bool down_transposed, int cores) -> ()");
   m.def("routed_experts_wait_producers(Tensor flags, int watchdog=60000000000) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
   m.impl("routed_experts_backward_tail", &BackwardTail);
+  m.impl("routed_experts_backward_accumulate", &BackwardAccumulate);
   m.impl("routed_experts_wait_producers", &WaitProducers);
 }

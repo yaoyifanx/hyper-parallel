@@ -58,12 +58,14 @@ class GradientWork:
     owner: object
     x: torch.Tensor
     dy: torch.Tensor
-    result: torch.Tensor
+    result: torch.Tensor | tuple[torch.Tensor, ...]
     tasks: torch.Tensor | None
     config: torch.Tensor | None
     initialized: Any
     cores: int
     submitted: bool = False
+    output_table: torch.Tensor | None = None
+    transposed: bool = False
 
 
 @dataclass
@@ -100,8 +102,8 @@ class BackwardWork:
     activation: torch.Tensor
     output: torch.Tensor
     ready: ExpertReadiness | None
-    down_gradient: torch.Tensor
-    gate_gradient: torch.Tensor
+    down_gradient: torch.Tensor | tuple[torch.Tensor, ...]
+    gate_gradient: torch.Tensor | tuple[torch.Tensor, ...]
     da_work: LinearWork
     dx_work: LinearWork
     down_work: GradientWork

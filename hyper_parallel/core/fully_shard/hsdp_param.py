@@ -18,6 +18,7 @@
 """HSDP parameter"""
 # pylint: disable=W0212
 from dataclasses import dataclass
+import os
 from typing import Callable, List, Optional, cast
 
 import torch
@@ -44,6 +45,28 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
     SourceShardMetaInfo,
 )
+
+
+@torch.no_grad()
+def pack_reduce_scatter_input(gradient: torch.Tensor, dtype: torch.dtype,
+                              world_size: int, shard_dim: int, output: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Convert each shard directly into the final rank-major RS buffer.
+
+    Avoids materializing both a full reduction-dtype gradient and its concatenated
+    permutation. Each destination slice is contiguous, including when the source
+    gradient is a transposed view. The caller owns the returned storage until RS
+    has finished. Uneven nonzero-dimension shards are rejected by FSDP itself.
+    """
+    if world_size < 1 or not 0 <= shard_dim < gradient.ndim or gradient.size(shard_dim) % world_size:
+        raise ValueError("reduce-scatter packing requires an evenly divisible valid shard dimension")
+    shape = list(gradient.shape)
+    shape[shard_dim] //= world_size
+    result = torch.empty((world_size, *shape), dtype=dtype, device=gradient.device) if output is None else output
+    if result.shape != (world_size, *shape) or result.dtype != dtype or result.device != gradient.device:
+        raise ValueError("RS packing output has incorrect shape, dtype or device")
+    for destination, source in zip(result.unbind(0), gradient.chunk(world_size, dim=shard_dim)):
+        destination.copy_(source)
+    return result.view(-1)
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -213,6 +236,9 @@ class HSDPParamV2:
         self._parameter_hook_migrator._save_backward_hooks(param)
         self._grad = None
         self._grad_allocation_stream = None
+        self.reduce_input_pool = None
+        self._reduce_input_lease = None
+        self.pack_reduce_input = os.environ.get("HP_FSDP_PACK_REDUCE_INPUT", "0") == "1"
         # Keep reduce-scatter accumulation in reduce_dtype until the final
         # micro-step performs the optional replicate all-reduce.
         self._reduce_partial_output = None
@@ -431,16 +457,38 @@ class HSDPParamV2:
         """
         if self.reduce_scatter_comm_ctx.reduce_scatter_handle is not None:
             self.reduce_scatter_comm_ctx.reduce_scatter_handle.wait()
-            if self._grad.device.type != "cpu":
-                stream = torch.get_device_module(self.device).current_stream(self.device)
-                if getattr(self, "_grad_allocation_stream", None) != stream:
-                    # A borrowed input or a different wait stream still needs protection.
-                    self._grad.record_stream(stream)
-            self._grad.untyped_storage().resize_(0)
-            self._grad = None
-            self._grad_allocation_stream = None
+            self._release_reduce_scatter_input()
             self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
         return self.reduce_scatter_comm_ctx.reduce_scatter_output
+
+    def release_reduce_scatter_input(self) -> bool:
+        """Retire RS input on its preparation stream while preserving output ownership.
+
+        Work.wait establishes the device dependency before returning storage to
+        the allocator. The handle remains available so a later output consumer
+        on another stream establishes its own dependency before reading it.
+        """
+        handle = self.reduce_scatter_comm_ctx.reduce_scatter_handle
+        if handle is None or self._grad is None:
+            return False
+        handle.wait()
+        self._release_reduce_scatter_input()
+        return True
+
+    def _release_reduce_scatter_input(self) -> None:
+        if self._grad is None:
+            return
+        if self._grad.device.type != "cpu":
+            stream = torch.get_device_module(self.device).current_stream(self.device)
+            if getattr(self, "_grad_allocation_stream", None) != stream:
+                self._grad.record_stream(stream)
+        if getattr(self, "_reduce_input_lease", None) is not None:
+            self.reduce_input_pool.release(self._reduce_input_lease)
+            self._reduce_input_lease = None
+        else:
+            self._grad.untyped_storage().resize_(0)
+        self._grad = None
+        self._grad_allocation_stream = None
 
     def clear_reduce_scatter_output(self) -> None:
         """Clear the reduce-scatter output tensor to free memory."""
@@ -1181,25 +1229,35 @@ class HSDPParamV2:
             self._grad = self.unsharded_grad_data
             self.unsharded_param.grad = None
         reduce_dtype = self.reduce_comm_dtype(self._grad)
-        owns_input = self._grad.dtype != reduce_dtype
-        self._grad = self._grad.to(reduce_dtype)
         shard_dim = self.hsdp_placement.dim
-        if self.shard_world_size <= 1:
-            self._grad = self._grad.view(-1)
-        elif shard_dim != 0:
-            grad_chunks = torch.chunk(self._grad, self.shard_world_size, dim=shard_dim)
-            self._grad = torch.cat(grad_chunks, dim=0).contiguous().view(-1)
+        if getattr(self, "pack_reduce_input", False) and self.shard_world_size > 1 and shard_dim != 0:
+            output = None
+            if self.reduce_input_pool is not None:
+                shape = list(self._grad.shape)
+                shape[shard_dim] //= self.shard_world_size
+                output, self._reduce_input_lease = self.reduce_input_pool.acquire(
+                    (self.shard_world_size, *shape), reduce_dtype, self._grad.device)
+            self._grad = pack_reduce_scatter_input(self._grad, reduce_dtype, self.shard_world_size, shard_dim, output)
             owns_input = True
-            grad_chunks = None
         else:
-            padded_unsharded_dim0 = self.padded_sharded_param_size[0] * self.shard_world_size
-            if self._grad.size(0) != padded_unsharded_dim0:
-                padded_unsharded_size = torch.Size((padded_unsharded_dim0, *self._grad.shape[1:]))
-                padded_grad = self._grad.new_zeros(padded_unsharded_size)
-                padded_grad.narrow(0, 0, self._grad.size(0)).copy_(self._grad)
-                self._grad = padded_grad
+            owns_input = self._grad.dtype != reduce_dtype
+            self._grad = self._grad.to(reduce_dtype)
+            if self.shard_world_size <= 1:
+                self._grad = self._grad.view(-1)
+            elif shard_dim != 0:
+                grad_chunks = torch.chunk(self._grad, self.shard_world_size, dim=shard_dim)
+                self._grad = torch.cat(grad_chunks, dim=0).contiguous().view(-1)
                 owns_input = True
-            self._grad = self._grad.view(-1)
+                grad_chunks = None
+            else:
+                padded_unsharded_dim0 = self.padded_sharded_param_size[0] * self.shard_world_size
+                if self._grad.size(0) != padded_unsharded_dim0:
+                    padded_unsharded_size = torch.Size((padded_unsharded_dim0, *self._grad.shape[1:]))
+                    padded_grad = self._grad.new_zeros(padded_unsharded_size)
+                    padded_grad.narrow(0, 0, self._grad.size(0)).copy_(self._grad)
+                    self._grad = padded_grad
+                    owns_input = True
+                self._grad = self._grad.view(-1)
         apply_gradient_scaling_factor(self._grad, self.gradient_scaling_factor)
 
         shard_process_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
@@ -1243,6 +1301,9 @@ class HSDPParamV2:
             async_op=async_op,
         )
         if not async_op:
+            if getattr(self, "_reduce_input_lease", None) is not None:
+                self.reduce_input_pool.release(self._reduce_input_lease)
+                self._reduce_input_lease = None
             self._grad = None
             self._grad_allocation_stream = None
 

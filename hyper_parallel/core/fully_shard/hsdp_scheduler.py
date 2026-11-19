@@ -16,6 +16,7 @@
 from contextlib import nullcontext
 import functools
 import inspect
+import os
 import weakref
 from typing import Any, Callable, List, Mapping, Optional, ParamSpec, Protocol, Tuple, TypeVar, Union
 
@@ -27,6 +28,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hook_function import PostBackwardFunction
+from hyper_parallel.core.fully_shard.reduce_buffer import ReduceBufferPool
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
     get_managed_modules_parameters,
@@ -90,6 +92,7 @@ class HSDPReductionPipeline:
         """Use the caller stream by default, or a dedicated preparation stream."""
         self.stream = stream
         self.last_state = None
+        self.reduce_input_pool = ReduceBufferPool(int(os.environ.get("HP_FSDP_RS_POOL_BYTES", "0")))
         self.pre_reduce_scatter_params = []
         self.pre_all_reduce_groups = []
         self.pending_all_reduce_groups = []
@@ -184,6 +187,7 @@ class HSDPSchedulerV2:
         self._param_grad_handles = {}
         self._param_grad_input_done = False
         self._pre_reduce_hook: Optional[Callable[[Any], None]] = None
+        self.early_release_rs_input = os.environ.get("HP_FSDP_EARLY_RS_INPUT", "1") == "1"
         # Flag to identify root module.
         self._is_root = True
         # module and its all sub-modules share one same 'HSDPSchedulerContext'
@@ -285,6 +289,14 @@ class HSDPSchedulerV2:
         """Forward pre hook to unsharded parameter for forward process."""
         logger.debug("hook=forward_pre enter module=%s", self.hsdp_state)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            # A checkpoint may wrap the expert unit itself. Its parameters were
+            # restored by pre-backward, but replay still needs its invocation
+            # inputs and the extension completion chain, without another AG.
+            extension = getattr(self.hsdp_state, "all_gather_extension", None)
+            prepare = getattr(extension, "fsdp_pre_forward", None)
+            if prepare is not None:
+                prepare(self.hsdp_state, args, kwargs)
+                self.hsdp_state.complete_unshard()
             logger.debug("hook=forward_pre skip module=%s reason=pre_backward", self.hsdp_state)
             return args, kwargs
         if self.scheduler_ctx.root_bp_state:
@@ -463,6 +475,11 @@ class HSDPSchedulerV2:
                     with torch.profiler.record_function("fsdp::gradient_extension"):
                         self._pre_reduce_hook(self.hsdp_state)
                 self.hsdp_state.post_backward()
+                if stream is not None and self.early_release_rs_input:
+                    # Expert-only queues may not be drained until the next MoE
+                    # finishes. Retire inputs here, keeping outputs and AR order.
+                    for param in self.hsdp_state.hsdp_params:
+                        param.release_reduce_scatter_input()
         if self._fsdp_group_post_pending is not None:
             self._fsdp_group_post_pending.clear()
 
@@ -747,6 +764,7 @@ class HSDPSchedulerV2:
                         context.allgather_handle.wait()
                         context.allgather_handle = None
                     context.allgather_output = None
+                    context.allgather_input = None
                     if state.is_shard and param.shard_world_size > 1:
                         param.free_unsharded_param()
             if state.param_group is not None:
@@ -762,6 +780,12 @@ class HSDPSchedulerV2:
                         result.all_gather_input = None
                         result.all_gather_output = None
                         bucket.all_gather_result = None
+            if state.is_shard:
+                # Retired speculative gathers must not suppress the next AG.
+                # Preserve these flags on any failed wait or an active full view.
+                state._all_gather_started = False
+                state._prefetch_pending = False
+                state._unshard_event = None
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.

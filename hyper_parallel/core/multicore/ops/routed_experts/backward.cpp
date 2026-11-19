@@ -80,7 +80,7 @@ __aicore__ inline void InputGradient(GM_ADDR dz, GM_ADDR weights, GM_ADDR tasks,
 __aicore__ inline void WeightGradient(GM_ADDR input, GM_ADDR derivative, GM_ADDR tasks,
                                      GM_ADDR output, GM_ADDR config, int32_t count,
                                      int32_t features, int32_t columns, int32_t experts,
-                                     GM_ADDR early_experts, bool early) {
+                                     GM_ADDR early_experts, bool early, bool mapped = false) {
   using A = matmul::MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, true>;
   using B = matmul::MatmulType<TPosition::GM, CubeFormat::ND, bfloat16_t, false>;
   using C = matmul::MatmulType<TPosition::GM, CubeFormat::ND, float>;
@@ -104,13 +104,17 @@ __aicore__ inline void WeightGradient(GM_ADDR input, GM_ADDR derivative, GM_ADDR
     GlobalTensor<float> dw;
     x.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(input) + task[5] * features + task[1]);
     dy.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(derivative) + task[5] * columns + task[3]);
-    dw.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(output) + (task[0] * features + task[1]) * columns + task[3]);
+    const auto base = mapped ? reinterpret_cast<const __gm__ int64_t *>(output)[task[0]] :
+                              reinterpret_cast<int64_t>(output) + task[0] * features * columns * sizeof(float);
+    dw.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(base) + task[1] * columns + task[3]);
     dw.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     mm.SetOrgShape(features, columns, task[6]);
     mm.SetSingleShape(task[2], task[4], task[6]);
     mm.SetTensorA(x, true);
     mm.SetTensorB(dy, false);
-    mm.IterateAll(dw, 0);
+    // enAtomic=1 adds the FP32 cube result to existing home g. Replica
+    // destinations overwrite this microstep's independent send storage.
+    mm.IterateAll(dw, mapped && !early ? 1 : 0);
   }
   mm.End();
 }
@@ -126,25 +130,33 @@ __aicore__ inline void PublishGradient(GM_ADDR flags) {
   __asm__ __volatile__("" ::: "memory");
 }
 
-template <bool TransposeB>
+template <bool TransposeB, bool Mapped = false>
 __global__ __aicore__ void BackwardTailKernel(GM_ADDR dz, GM_ADDR weights, GM_ADDR dx_tasks,
     GM_ADDR dx, GM_ADDR dx_config, GM_ADDR ready, GM_ADDR x, GM_ADDR activation, GM_ADDR dv,
     GM_ADDR gate_tasks, GM_ADDR gate_gradient, GM_ADDR gate_config,
     GM_ADDR down_tasks, GM_ADDR down_gradient, GM_ADDR down_config, GM_ADDR early_experts, GM_ADDR gradient_ready,
     int32_t dx_count, int32_t gate_count, int32_t down_count,
-    int32_t hidden, int32_t inner, int32_t experts) {
-  WeightGradient(x, dz, gate_tasks, gate_gradient, gate_config, gate_count, hidden, inner * 2, experts,
-                 early_experts, true);
-  WeightGradient(activation, dv, down_tasks, down_gradient, down_config, down_count, inner, hidden, experts,
-                 early_experts, true);
+    int32_t hidden, int32_t inner, int32_t experts, bool gate_transposed = false, bool down_transposed = false) {
+  const auto gate_x = gate_transposed ? dz : x;
+  const auto gate_dy = gate_transposed ? x : dz;
+  const auto gate_features = gate_transposed ? inner * 2 : hidden;
+  const auto gate_columns = gate_transposed ? hidden : inner * 2;
+  const auto down_x = down_transposed ? dv : activation;
+  const auto down_dy = down_transposed ? activation : dv;
+  const auto down_features = down_transposed ? hidden : inner;
+  const auto down_columns = down_transposed ? inner : hidden;
+  WeightGradient(gate_x, gate_dy, gate_tasks, gate_gradient, gate_config, gate_count, gate_features, gate_columns, experts,
+                 early_experts, true, Mapped);
+  WeightGradient(down_x, down_dy, down_tasks, down_gradient, down_config, down_count, down_features, down_columns, experts,
+                 early_experts, true, Mapped);
   PublishGradient(gradient_ready);
   InputGradient<TransposeB>(dz, weights, dx_tasks, dx, dx_config, ready, dx_count, hidden, inner, experts);
   // Cores retain their unique complete-token output tiles. There is no global
   // dX barrier: a core can produce dW while transport consumes published dX.
-  WeightGradient(x, dz, gate_tasks, gate_gradient, gate_config, gate_count, hidden, inner * 2, experts,
-                 early_experts, false);
-  WeightGradient(activation, dv, down_tasks, down_gradient, down_config, down_count, inner, hidden, experts,
-                 early_experts, false);
+  WeightGradient(gate_x, gate_dy, gate_tasks, gate_gradient, gate_config, gate_count, gate_features, gate_columns, experts,
+                 early_experts, false, Mapped);
+  WeightGradient(down_x, down_dy, down_tasks, down_gradient, down_config, down_count, down_features, down_columns, experts,
+                 early_experts, false, Mapped);
 }
 
 }  // namespace
@@ -172,6 +184,38 @@ extern "C" int RoutedExpertsBackwardTail(void *stream, void *dz, void *weights, 
     static_cast<uint8_t *>(down_tasks), static_cast<uint8_t *>(down_gradient), static_cast<uint8_t *>(down_config), \
     static_cast<uint8_t *>(early_experts), static_cast<uint8_t *>(gradient_ready), \
     dx_count, gate_count, down_count, hidden, inner, experts)
+  if (transpose_b) {
+    HP_BACKWARD_LAUNCH(true);
+  } else {
+    HP_BACKWARD_LAUNCH(false);
+  }
+#undef HP_BACKWARD_LAUNCH
+  return static_cast<int>(aclrtGetLastError(ACL_RT_THREAD_LEVEL));
+}
+
+extern "C" int RoutedExpertsBackwardAccumulate(void *stream, void *dz, void *weights, void *dx_tasks,
+    void *dx, void *dx_config, void *output_ready, void *x, void *activation, void *dv,
+    void *gate_tasks, void *gate_gradient, void *gate_config,
+    void *down_tasks, void *down_gradient, void *down_config, void *early_experts, void *gradient_ready,
+    int32_t dx_count, int32_t gate_count, int32_t down_count,
+    int32_t hidden, int32_t inner, int32_t experts, int32_t cores, bool transpose_b, bool gate_transposed, bool down_transposed) {
+  if (cores < 1 || cores > 24 || dx_count < cores || gate_count < 1 || down_count < 1 ||
+      hidden < 16 || hidden > 32768 || hidden % 16 || inner < 16 || inner > 32768 || inner % 16 || experts < 1) {
+    return -1;
+  }
+  const auto error = aclrtGetLastError(ACL_RT_THREAD_LEVEL);
+  if (error != ACL_SUCCESS) {
+    return static_cast<int>(error);
+  }
+#define HP_BACKWARD_LAUNCH(transpose) \
+  BackwardTailKernel<transpose, true><<<cores, nullptr, stream>>>( \
+    static_cast<uint8_t *>(dz), static_cast<uint8_t *>(weights), static_cast<uint8_t *>(dx_tasks), \
+    static_cast<uint8_t *>(dx), static_cast<uint8_t *>(dx_config), static_cast<uint8_t *>(output_ready), \
+    static_cast<uint8_t *>(x), static_cast<uint8_t *>(activation), static_cast<uint8_t *>(dv), \
+    static_cast<uint8_t *>(gate_tasks), static_cast<uint8_t *>(gate_gradient), static_cast<uint8_t *>(gate_config), \
+    static_cast<uint8_t *>(down_tasks), static_cast<uint8_t *>(down_gradient), static_cast<uint8_t *>(down_config), \
+    static_cast<uint8_t *>(early_experts), static_cast<uint8_t *>(gradient_ready), \
+    dx_count, gate_count, down_count, hidden, inner, experts, gate_transposed, down_transposed)
   if (transpose_b) {
     HP_BACKWARD_LAUNCH(true);
   } else {

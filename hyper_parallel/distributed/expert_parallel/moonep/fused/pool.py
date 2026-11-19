@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import prod
+import os
 from typing import Any
 
 import torch
@@ -83,6 +84,7 @@ class ReplicaSlot:
     generation: int = 0
     in_use: bool = False
     last_read: Any = None
+    capacity: int = 0
 
 
 class ReplicaPool:
@@ -94,6 +96,7 @@ class ReplicaPool:
         if isinstance(slot_count, bool) or not isinstance(slot_count, int) or slot_count < 1:
             raise ValueError("replica slot count must be a positive integer")
         self.slot_count = slot_count
+        self.compact = os.environ.get("HP_MOONEP_COMPACT_WEIGHTS", "0") == "1"
         self.home_count = 0
         self.replica_capacity = 0
         self.shapes: tuple[tuple[int, ...], ...] = ()
@@ -134,12 +137,29 @@ class ReplicaPool:
             self._allocate_slot(slot)
 
     def _allocate_slot(self, slot: ReplicaSlot) -> None:
+        capacity = slot.capacity if self.compact else self.replica_capacity
         for role, shape, transpose in zip(("gate", "down"), self.shapes, self.transposed):
             physical = tuple(reversed(shape)) if transpose else shape
-            slot.matrices[role] = torch.empty((self.replica_capacity, *physical), dtype=self.dtype,
+            slot.matrices[role] = torch.empty((capacity, *physical), dtype=self.dtype,
                                               device=self.device)
             if transpose:
                 slot.matrices[role] = slot.matrices[role].transpose(-2, -1)
+
+    def ensure_capacity(self, slot: ReplicaSlot, demand: int) -> None:
+        """Grow an idle replica slot only to its observed bounded high-water bucket.
+
+        The caller joins the last reader and converges failures across EP peers
+        before submitting any weight payload. Existing leases are never resized.
+        """
+        if not self.compact or demand <= slot.capacity:
+            return
+        if slot.in_use or not 0 <= demand <= self.replica_capacity:
+            raise ValueError("replica growth requires an idle slot within the admitted capacity")
+        capacity = min(self.replica_capacity, ((demand + 3) // 4) * 4)
+        replacement = ReplicaSlot(capacity=capacity)
+        self._allocate_slot(replacement)
+        slot.matrices = replacement.matrices
+        slot.capacity = capacity
 
     def retire_slots(self) -> None:
         """Drop idle W storage references while preserving generations and fences."""

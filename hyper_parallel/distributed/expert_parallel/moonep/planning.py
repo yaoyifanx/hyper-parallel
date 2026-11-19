@@ -49,6 +49,7 @@ class ExecutionPlan:
     any_migration: bool
     metrics: tuple[int, ...]
     dedup: TokenDedup | None = None
+    send_slots: tuple[int, ...] = ()
     planner_fallback: bool = False
     chunk_metadata: ChunkMetadata | None = None
 
@@ -281,7 +282,7 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     # rows, four peer split tables, expert row counts, then optional chunk rows.
     controls = [score, valid.long().reshape(1), geometry.max_receive_rows.reshape(1),
                 geometry.peer_rows[rank], geometry.peer_rows[:, rank],
-                geometry.weight_send, geometry.weight_recv, geometry.groups]
+                geometry.weight_send, geometry.weight_recv, geometry.groups, geometry.send_ids]
     rounds = None
     if chunk_rows is not None:
         rounds = compile_round_geometry(geometry, rank, chunk_rows, ids.numel(), graphs)
@@ -319,6 +320,8 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
     active_count = home_count + sum(weight_recv)
     group_counts = tuple(header[offset:offset + active_count])
     offset += slots_capacity
+    send_slots = tuple(header[offset:offset + sum(weight_send)])
+    offset += geometry.send_ids.numel()
     chunk_metadata = None
     if rounds is not None:
         count = (max_receive_rows + chunk_rows - 1) // chunk_rows
@@ -340,6 +343,6 @@ def compile_plan(counts: torch.Tensor, allocation: torch.Tensor, ids: torch.Tens
         dispatch_order, unpermute_indices, sort_order,
         boundaries[:active_count], group_counts, token_send, token_recv, weight_send, weight_recv,
         geometry.send_ids[:sum(weight_send)], home_count, bool(replica_count), allocation_metrics,
-        planner_fallback=bool(planner_fallback),
+        send_slots=send_slots, planner_fallback=bool(planner_fallback),
         chunk_metadata=chunk_metadata,
     )

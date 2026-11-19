@@ -15,7 +15,7 @@
 """不保存专家权重的两次前向/四次反向GMM与激活导数。"""
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Optional, Union
 
 import torch
 from torch.nn import functional
@@ -23,7 +23,65 @@ from torch.nn import functional
 from hyper_parallel.components.functional.clipped_activation import clipped_swiglu, clipped_swiglu_backward
 
 
-GroupedOp = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+@dataclass(frozen=True)
+class GroupedWeightViews:
+    """Uniform expert matrix views without materializing their stacked home weights."""
+
+    matrices: tuple[torch.Tensor, ...] = ()
+    parts: tuple[torch.Tensor, ...] = ()
+    rows_per_part: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.parts:
+            if self.matrices or len(self.parts) != len(self.rows_per_part):
+                raise ValueError("grouped weight parts require one row count per batch and no matrix list")
+            first = self.parts[0]
+            if first.ndim != 3 or any(value.ndim != 3 or value.shape[1:] != first.shape[1:]
+                                      or value.device != first.device or value.dtype != first.dtype
+                                      for value in self.parts):
+                raise ValueError("grouped weight parts must have uniform matrix shapes, dtype, and device")
+            if (not 1 <= sum(value.shape[0] for value in self.parts) <= 128
+                    or any(isinstance(rows, bool) or not isinstance(rows, int) or rows < 0
+                           or (rows > 0 and not value.shape[0])
+                           for value, rows in zip(self.parts, self.rows_per_part))):
+                raise ValueError("grouped weight parts require admitted expert and nonnegative row counts")
+            return
+        if not 1 <= len(self.matrices) <= 128:
+            raise ValueError("grouped weight views require between one and 128 expert matrices")
+        first = self.matrices[0]
+        if first.ndim != 2 or any(value.ndim != 2 or value.shape != first.shape
+                                  or value.device != first.device or value.dtype != first.dtype
+                                  for value in self.matrices):
+            raise ValueError("grouped weight views must have one shape, dtype, and device")
+
+    @property
+    def shape(self) -> torch.Size:
+        """Return the logical stacked shape without allocating that stack."""
+        if self.parts:
+            return torch.Size((sum(value.shape[0] for value in self.parts), *self.parts[0].shape[1:]))
+        return torch.Size((len(self.matrices), *self.matrices[0].shape))
+
+    def transpose(self, dim0: int, dim1: int) -> "GroupedWeightViews":
+        """Transpose expert matrices while preserving the grouped expert axis."""
+        if {dim0 % 3, dim1 % 3} != {1, 2}:
+            raise ValueError("grouped weight views only transpose the last two dimensions")
+        if self.parts:
+            return GroupedWeightViews(parts=tuple(value.transpose(1, 2) for value in self.parts),
+                                      rows_per_part=self.rows_per_part)
+        return GroupedWeightViews(tuple(value.t() for value in self.matrices))
+
+    def record_stream(self, stream: Any) -> None:
+        """Protect each distinct home/remote storage once on its consumer stream."""
+        seen = set()
+        for value in self.parts or self.matrices:
+            pointer = value.untyped_storage().data_ptr()
+            if pointer not in seen:
+                value.record_stream(stream)
+                seen.add(pointer)
+
+
+GroupedWeights = Union[torch.Tensor, GroupedWeightViews]
+GroupedOp = Callable[[torch.Tensor, GroupedWeights, torch.Tensor], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -46,8 +104,8 @@ class ExpertSaved:
 @torch.no_grad()
 def expert_forward_values(
     x: torch.Tensor,
-    gate_up: torch.Tensor,
-    down: torch.Tensor,
+    gate_up: GroupedWeights,
+    down: GroupedWeights,
     boundaries: torch.Tensor,
     limit: float,
     gmm: GroupedOp,
@@ -86,11 +144,11 @@ def expert_forward_values(
 def expert_backward_values(
     grad_output: torch.Tensor,
     saved: ExpertSaved,
-    gate_up: torch.Tensor,
-    down: torch.Tensor,
+    gate_up: GroupedWeights,
+    down: GroupedWeights,
     gmm: GroupedOp,
     gmm_weight_grad: GroupedOp,
-    on_weight_gradients: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+    on_weight_gradients: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """用重新物化的权重计算四次 GMM 反向，不重跑前向矩阵乘。
 
@@ -171,22 +229,54 @@ def swiglu_grad(gradient: torch.Tensor, preact: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def grouped_values(x: torch.Tensor, weight: torch.Tensor, boundaries: torch.Tensor) -> torch.Tensor:
+def grouped_values(x: torch.Tensor, weight: GroupedWeights,
+                   boundaries: torch.Tensor) -> torch.Tensor:
     """不构造权重autograd缓存的分组乘法；例如两组输入分别乘weight[0]/weight[1]。"""
     if x.shape[0] == 0:
         return x.new_empty((0, weight.shape[-1]))
     if x.device.type == "npu":
         import torch_npu  # pylint: disable=import-outside-toplevel
+        if isinstance(weight, GroupedWeightViews) and weight.parts:
+            return _grouped_parts(x, weight, boundaries, torch_npu.npu_grouped_matmul)
         return torch_npu.npu_grouped_matmul(
-            x=[x], weight=[weight], bias=[], group_list=boundaries,
+            x=[x], weight=list(weight.matrices) if isinstance(weight, GroupedWeightViews) else [weight],
+            bias=[], group_list=boundaries,
             split_item=3, group_type=0, group_list_type=0,
         )[0]
     begin = 0
     outputs = []
+    matrices = weight
+    if isinstance(weight, GroupedWeightViews):
+        matrices = (tuple(matrix for part in weight.parts for matrix in part.unbind(0))
+                    if weight.parts else weight.matrices)
     for index, end in enumerate(boundaries.tolist()):
-        outputs.append(x[begin:end] @ weight[index])
+        outputs.append(x[begin:end] @ matrices[index])
         begin = end
     return torch.cat(outputs)
+
+
+def _grouped_parts(x: torch.Tensor, weight: GroupedWeightViews, boundaries: torch.Tensor,
+                   operator: Callable) -> torch.Tensor:
+    """Use batched home/remote GEMMs without a per-expert Python weight list."""
+    if sum(weight.rows_per_part) != x.shape[0] or boundaries.numel() != weight.shape[0]:
+        raise ValueError("grouped weight partitions do not cover the input and expert boundaries")
+    nonempty = sum(rows > 0 for rows in weight.rows_per_part)
+    result = None if nonempty == 1 else x.new_empty((x.shape[0], weight.shape[-1]))
+    row_begin = group_begin = 0
+    for part, rows in zip(weight.parts, weight.rows_per_part):
+        group_end = group_begin + part.shape[0]
+        if rows:
+            groups = boundaries[group_begin:group_end]
+            if row_begin:
+                groups = groups - row_begin
+            value = operator(x=[x[row_begin:row_begin + rows]], weight=[part], bias=[],
+                             group_list=groups, split_item=3, group_type=0, group_list_type=0)[0]
+            if result is None:
+                return value
+            result[row_begin:row_begin + rows].copy_(value)
+        row_begin += rows
+        group_begin = group_end
+    return result
 
 
 @torch.no_grad()
@@ -206,3 +296,33 @@ def grouped_weight_grad(x: torch.Tensor, gradient: torch.Tensor, boundaries: tor
         outputs.append(x[begin:end].T @ gradient[begin:end])
         begin = end
     return torch.stack(outputs)
+
+
+@torch.no_grad()
+def grouped_weight_grad_add(target: torch.Tensor, x: torch.Tensor, derivative: torch.Tensor,
+                            boundaries: torch.Tensor, *, transposed: bool = False) -> None:
+    """Accumulate home dW directly in the parameter's contiguous FP32 storage.
+
+    BF16/FP16 operands retain the forward rounding. No BF16 dW is materialized.
+    Empty groups preserve previous microsteps, including an entirely empty batch.
+    """
+    if target.dtype != torch.float32 or not target.is_contiguous():
+        raise ValueError("grouped wgrad accumulation requires contiguous FP32 parameter storage")
+    if x.dtype != derivative.dtype or x.shape[0] != derivative.shape[0]:
+        raise ValueError("grouped wgrad operands must have matching dtype and rows")
+    if target.shape[0] != boundaries.numel():
+        raise ValueError("one grouped boundary is required per home expert")
+    left, right = (derivative, x) if transposed else (x, derivative)
+    if target.shape[1:] != (left.shape[1], right.shape[1]):
+        raise ValueError("grouped wgrad destination does not match the parameter layout")
+    if not x.shape[0]:
+        return
+    if x.device.type == "npu":
+        # Optional Ascend dependency; CPU numerical tests use the same FP32 contract.
+        import torch_npu  # pylint: disable=import-outside-toplevel
+        torch_npu.npu_grouped_matmul_add_(target, left, right, boundaries)
+        return
+    start = 0
+    for index, end in enumerate(boundaries.tolist()):
+        target[index].addmm_(left[start:end].float().T, right[start:end].float())
+        start = end

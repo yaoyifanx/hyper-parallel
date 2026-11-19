@@ -116,13 +116,49 @@ def _prepare_backward(dy: torch.Tensor, state: ExpertState, values: torch.Tensor
     token = runtime.arena.begin()
     try:
         dy = dy.contiguous()
-        outputs = tuple(torch.empty(shape, dtype=torch.bfloat16, device=dy.device) for shape in shapes)
+        scheduler = getattr(executor.owner, "hsdp_scheduler", None)
+        extension = getattr(executor, "gradient_extension", None)
+        accumulated = extension is not None and extension.uses_accumulated_grad(scheduler.hsdp_state)
+        direct_send = accumulated and runtime.direct_grad_send
+        mapped, transposed = None, (False, False)
+        received = staging = None
+        if direct_send:
+            received, staging = prepare_gradient_storage(
+                runtime.arena.allocate, (plan.route.received_rows, dy.shape[1]),
+                staging_elements=plan.gradient_staging_elements)
+        if accumulated:
+            outputs = extension.accumulation_buffers(scheduler.hsdp_state)
+            transposed = tuple(value[1] for value in extension._layouts(scheduler.hsdp_state))
+            if direct_send:
+                mapped = runtime.gradient_domain.accumulation_targets(
+                    plan.route.active_experts, executor.home_count, outputs,
+                    plan.gradient_transfer, staging=staging)
+            else:
+                mapped = []
+                for role, output in enumerate(outputs):
+                    replica_count = sum(expert // executor.home_count != executor.rank
+                                        for expert in plan.route.active_experts)
+                    replicas = runtime.arena.allocate("replica_dW_" + str(role),
+                                                      (replica_count, *output.shape[1:]), torch.float32)
+                    replica_index = 0
+                    targets = []
+                    for expert in plan.route.active_experts:
+                        if expert // executor.home_count == executor.rank:
+                            targets.append(output[expert % executor.home_count])
+                        else:
+                            targets.append(replicas[replica_index])
+                            replica_index += 1
+                    mapped.append(tuple(targets))
+                mapped = tuple(mapped)
+        else:
+            outputs = tuple(torch.empty(shape, dtype=torch.bfloat16, device=dy.device) for shape in shapes)
         groups = getattr(plan, 'grouped', None)
         dv = None if groups is not None else runtime.arena.allocate("selections", tuple(values.shape), values.dtype)
         ds = None if groups is not None else torch.empty_like(scores)
-        received, staging = prepare_gradient_storage(
-            runtime.arena.allocate, (plan.route.received_rows, dy.shape[1]),
-            staging_elements=plan.gradient_staging_elements)
+        if received is None:
+            received, staging = prepare_gradient_storage(
+                runtime.arena.allocate, (plan.route.received_rows, dy.shape[1]),
+                staging_elements=plan.gradient_staging_elements)
         if groups is None:
             incoming = prepare_exchange(dv, plan.route, runtime.workspace, output=received, publish_each_block=True)
         else:
@@ -136,10 +172,15 @@ def _prepare_backward(dy: torch.Tensor, state: ExpertState, values: torch.Tensor
         compute = plan.compute.prepare_backward(incoming.value, state, gate_up, down,
                                                 allocator=runtime.arena.allocate, pipeline=True,
                                                 early_experts=tuple(expert // executor.home_count != executor.rank
-                                                                    for expert in plan.route.active_experts))
-        gradient = runtime.gradient_domain.prepare_gradient_payload(
+                                                                    for expert in plan.route.active_experts),
+                                                **({"gradient_outputs": mapped, "gradient_transposed": transposed}
+                                                   if accumulated else {}))
+        prepare_gradient = (runtime.gradient_domain.prepare_accumulated_payload if accumulated
+                            else runtime.gradient_domain.prepare_gradient_payload)
+        gradient = prepare_gradient(
             plan.route.active_experts, executor.home_count, (compute.gate_gradient, compute.down_gradient),
-            plan.gradient_transfer, compute.gradient_ready, outputs=outputs, staging=staging)
+            plan.gradient_transfer, compute.gradient_ready, outputs=outputs, staging=staging,
+            **({"direct_send": direct_send} if accumulated else {}))
         if groups is None:
             # T serializes dispatch and return, so its final write can reuse dV.
             returned = prepare_exchange(compute.output, plan.route, runtime.workspace, reverse=True,
@@ -288,11 +329,15 @@ class SparseExpertFunction(torch.autograd.Function):
                 ds = returned.scalars.reshape(ctx.score_shape).to(ctx.score_dtype)
             runtime.arena.end(phase.arena_token)
             runtime.statistics["scratch_reserved_bytes"] = runtime.arena.reserved_bytes
-            if (home_gate_up.shape, home_down.shape) != ctx.shapes:
+            accumulated = getattr(phase.gradient, "accumulated", False)
+            if not accumulated and (home_gate_up.shape, home_down.shape) != ctx.shapes:
                 raise RuntimeError("complete sparse gradients must match the actual autograd parameter inputs")
             runtime.release(key)
             runtime.complete(key)
             ctx.group_metadata = None
+            if accumulated:
+                executor.gradient_extension.notify_accumulated(executor.owner.hsdp_scheduler)
+                home_gate_up = home_down = None
             return dx, ds, home_gate_up, home_down, None, None
         except BaseException:
             runtime.poisoned = True

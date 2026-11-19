@@ -25,4 +25,11 @@ extern "C" int RoutedExpertsBackwardTail(void *stream, void *dz, void *weights, 
     int32_t dx_count, int32_t gate_count, int32_t down_count,
     int32_t hidden, int32_t inner, int32_t experts, int32_t cores, bool transpose_b);
 
+extern "C" int RoutedExpertsBackwardAccumulate(void *stream, void *dz, void *weights, void *dx_tasks,
+    void *dx, void *dx_config, void *output_ready, void *x, void *activation, void *dv,
+    void *gate_tasks, void *gate_gradient, void *gate_config,
+    void *down_tasks, void *down_gradient, void *down_config, void *early_experts, void *gradient_ready,
+    int32_t dx_count, int32_t gate_count, int32_t down_count,
+    int32_t hidden, int32_t inner, int32_t experts, int32_t cores, bool transpose_b, bool gate_transposed, bool down_transposed);
+
 extern "C" int RoutedExpertsWaitProducers(void *stream, void *flags, int32_t producers, int64_t watchdog);

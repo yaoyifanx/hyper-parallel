@@ -28,7 +28,7 @@ from tests.common.mark_utils import arg_mark
 
 
 _REGIONS = ("selections", "incoming", "down_gradient", "gate_gradient", "activation",
-            "project", "forward_activation")
+            "project", "forward_activation", "replica_dW_0", "replica_dW_1")
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
@@ -48,7 +48,7 @@ class TestFinishStepScratch(unittest.TestCase):
         token = self.runtime.arena.begin()
         values = {}
         for name in _REGIONS:
-            dtype = torch.float32 if name.endswith("gradient") else torch.bfloat16
+            dtype = torch.float32 if name.endswith("gradient") or name.startswith("replica_dW") else torch.bfloat16
             value = self.runtime.arena.allocate(name, (3,), dtype)
             value.fill_(7)
             values[name] = value

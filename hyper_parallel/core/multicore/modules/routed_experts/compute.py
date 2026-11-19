@@ -140,10 +140,20 @@ def _check_tensor(value: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtyp
         raise ValueError(f"{name} storage has been invalidated or is undersized")
 
 
-def _check_output_aliases(output: torch.Tensor, *inputs: torch.Tensor) -> None:
-    """Reject writable storage aliases even when the individual views are disjoint."""
-    if output.numel() and any(value.numel() and value.untyped_storage().data_ptr()
-                              == output.untyped_storage().data_ptr() for value in inputs):
+def _check_output_aliases(output: torch.Tensor, *inputs: torch.Tensor,
+                          allow_disjoint_storage: bool = False) -> None:
+    """Reject storage aliases except explicitly admitted disjoint dense ranges."""
+    if not output.numel():
+        return
+    start = output.data_ptr()
+    end = start + output.numel() * output.element_size()
+    for value in inputs:
+        if not value.numel() or value.untyped_storage().data_ptr() != output.untyped_storage().data_ptr():
+            continue
+        if allow_disjoint_storage and output.is_contiguous() and value.is_contiguous():
+            other = value.data_ptr()
+            if end <= other or other + value.numel() * value.element_size() <= start:
+                continue
         raise ValueError("native compute output must not alias an input storage")
 
 
@@ -380,6 +390,29 @@ class NativeExpertCompute:
         current.wait_event(initialized)
         return GradientWork(self, x, dy, result, tasks, config, initialized, min(24, tasks.shape[0]))
 
+    def prepare_mapped_gradient(self, x: torch.Tensor, dy: torch.Tensor,
+                                outputs: Sequence[torch.Tensor], transposed: bool) -> GradientWork:
+        """Prepare direct per-expert FP32 destinations without a compact home dW table."""
+        self._check_input(x, "gradient input")
+        self._check_input(dy, "gradient derivative")
+        left, right = (dy, x) if transposed else (x, dy)
+        if len(outputs) != len(self.boundaries):
+            raise ValueError("mapped gradients require one destination per active expert")
+        for output in outputs:
+            _check_tensor(output, (left.shape[1], right.shape[1]), torch.float32, self.device, "mapped dW")
+            _check_output_aliases(output, x, dy, allow_disjoint_storage=True)
+        if not self.boundaries:
+            return GradientWork(self, left, right, tuple(outputs), None, None, self.initialized, 0)
+        tasks = upload_metadata(gradient_tasks(self.boundaries, left.shape[1], right.shape[1]), self.device)
+        maximum = max(end - start for start, end in zip((0, *self.boundaries[:-1]), self.boundaries))
+        config = upload_metadata(_gradient_config(left.shape[1], right.shape[1], maximum), self.device)
+        pointers = upload_metadata(
+            torch.tensor([value.data_ptr() for value in outputs], dtype=torch.int64), self.device)
+        initialized = torch.npu.Event()
+        initialized.record(torch.npu.current_stream(self.device))
+        return GradientWork(self, left, right, tuple(outputs), tasks, config, initialized,
+                            min(24, tasks.shape[0]), output_table=pointers, transposed=transposed)
+
     def run_gradient(self, work: GradientWork) -> torch.Tensor:
         """Submit an already allocated expert gradient and retain its input lifetimes."""
         self._consume(work)
@@ -441,7 +474,9 @@ class NativeExpertCompute:
     @torch.no_grad()
     def prepare_backward(self, dv: torch.Tensor, state: ExpertState, gate: Sequence[torch.Tensor],
                          down: Sequence[torch.Tensor], *, allocator: TensorAllocator | None = None,
-                         pipeline: bool = False, early_experts: Sequence[bool] | None = None) -> BackwardWork:
+                         pipeline: bool = False, early_experts: Sequence[bool] | None = None,
+                         gradient_outputs: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]] | None = None,
+                         gradient_transposed: tuple[bool, bool] = (False, False)) -> BackwardWork:
         """Allocate B outputs while reusing storage after each preceding reader.
 
         The returned output/readiness and two FP32 gradient tensors can be used
@@ -470,15 +505,21 @@ class NativeExpertCompute:
         _check_output_aliases(storage, dv, state.x, state.preact, *gate, *down)
         if pipeline:
             _check_output_aliases(activation, dz, dv, state.x, state.preact, storage, *gate, *down)
-        down_gradient = self._allocate(allocator, "down_gradient",
-                                       (len(self.boundaries), intermediate, hidden), torch.float32)
-        gate_gradient = self._allocate(allocator, "gate_gradient",
-                                       (len(self.boundaries), hidden, 2 * intermediate), torch.float32)
-        _check_output_aliases(down_gradient, gate_gradient, dv, state.x, state.preact, dz, storage, *gate, *down)
-        _check_output_aliases(gate_gradient, dv, state.x, state.preact, dz, storage, *gate, *down)
         da_work = self.prepare_linear(dv, tuple(weight.t() for weight in down), intermediate, output=da)
-        down_work = self.prepare_gradient(activation, dv, output=down_gradient)
-        gate_work = self.prepare_gradient(state.x, dz, output=gate_gradient)
+        if gradient_outputs is None:
+            down_gradient = self._allocate(allocator, "down_gradient",
+                                           (len(self.boundaries), intermediate, hidden), torch.float32)
+            gate_gradient = self._allocate(allocator, "gate_gradient",
+                                           (len(self.boundaries), hidden, 2 * intermediate), torch.float32)
+            _check_output_aliases(down_gradient, gate_gradient, dv, state.x, state.preact, dz, storage, *gate, *down)
+            _check_output_aliases(gate_gradient, dv, state.x, state.preact, dz, storage, *gate, *down)
+            down_work = self.prepare_gradient(activation, dv, output=down_gradient)
+            gate_work = self.prepare_gradient(state.x, dz, output=gate_gradient)
+        else:
+            if not pipeline:
+                raise ValueError("mapped gradient accumulation requires the backward tail pipeline")
+            gate_work = self.prepare_mapped_gradient(state.x, dz, gradient_outputs[0], gradient_transposed[0])
+            down_work = self.prepare_mapped_gradient(activation, dv, gradient_outputs[1], gradient_transposed[1])
         dx_work = self.prepare_linear(dz, tuple(weight.t() for weight in gate), hidden, publish=True, output=dx)
         priorities, gradient_ready = None, None
         if pipeline:
@@ -510,9 +551,15 @@ class NativeExpertCompute:
         dx.ready.poll_after.event.record(current)
         operands = (work.dz, dx.weight_table, dx.tasks, dx.config, work.state.x,
                     work.activation, work.dv, gate.tasks, gate.config, down.tasks, down.config, work.early_experts)
-        torch.ops.hyper_parallel.routed_experts_backward_tail(
-            dx.weights, operands, work.output, work.gate_gradient, work.down_gradient,
-            dx.ready.flags, work.gradient_ready.flags, dx.transposed, dx.cores)
+        if gate.output_table is None:
+            torch.ops.hyper_parallel.routed_experts_backward_tail(
+                dx.weights, operands, work.output, work.gate_gradient, work.down_gradient,
+                dx.ready.flags, work.gradient_ready.flags, dx.transposed, dx.cores)
+        else:
+            torch.ops.hyper_parallel.routed_experts_backward_accumulate(
+                dx.weights, (*operands, gate.output_table, down.output_table), work.output,
+                work.gate_gradient, work.down_gradient, dx.ready.flags, work.gradient_ready.flags,
+                dx.transposed, gate.transposed, down.transposed, dx.cores)
         dx.ready.poll_after.queued = True
 
     @torch.no_grad()

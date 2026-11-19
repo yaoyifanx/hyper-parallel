@@ -20,6 +20,7 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from numbers import Integral
+import os
 from typing import Any, Callable
 
 import torch
@@ -37,8 +38,8 @@ from hyper_parallel.distributed.expert_parallel.moonep.lifecycle import Executio
 from hyper_parallel.distributed.expert_parallel.moonep.layout import RouteGeometry, route_geometry
 from hyper_parallel.distributed.expert_parallel.moonep.fused.executor import SparseMoonEPExecutor, SparseMoonEPRuntime
 from hyper_parallel.distributed.expert_parallel.moonep.numerics import (
-    ExpertSaved, activation_gradient, expert_backward_values, expert_forward_values,
-    grouped_values, grouped_weight_grad,
+    ExpertSaved, GroupedWeights, GroupedWeightViews, activation_gradient, expert_backward_values, expert_forward_values,
+    grouped_values, grouped_weight_grad, grouped_weight_grad_add,
 )
 from hyper_parallel.distributed.expert_parallel.moonep.planning import (
     ExecutionPlan, compile_plan, prepare_entry_order,
@@ -87,8 +88,8 @@ class _WeightLease:
     """当前执行键的槽租约与物化完成事件；例如K6被K7预取后直接命中。"""
 
     slot: _WeightTableSlot
-    gate_up: torch.Tensor
-    down: torch.Tensor
+    gate_up: GroupedWeights
+    down: GroupedWeights
     ready: Any
     consumed: bool = False
 
@@ -120,6 +121,17 @@ class MoonEPRuntime(MoonEPLifecycle):
         self.standalone_prefetch = standalone_prefetch
         self.home_layout_slots: dict[ExecutionKey, _WeightTableSlot] = {}
         self.home_layout_stream = None
+        self.compact_weight_slots = os.environ.get("HP_MOONEP_COMPACT_WEIGHTS", "0") == "1"
+        self.release_w_workspace = os.environ.get("HP_MOONEP_RELEASE_W_WORKSPACE", "0") == "1"
+        self.home_weight_mode = os.environ.get("HP_MOONEP_HOME_WEIGHT_VIEWS", "0")
+        if self.home_weight_mode not in ("0", "1", "2"):
+            raise ValueError("home weight views must be 0 (stack), 1 (matrix list), or 2 (batched parts)")
+        self.home_weight_views = self.home_weight_mode != "0"
+        if self.home_weight_views and any(getattr(executor, "chunked", None) is not None for executor in executors):
+            raise ValueError("home weight views require the complete nonchunk expert path")
+        if self.home_weight_views and any(executor.home_count + executor.replica_capacity > 128
+                                         for executor in executors):
+            raise ValueError("home weight views require at most 128 admitted local and remote experts")
         self.slots: list[_WeightTableSlot] = []
         self.weight_workspace: dict[str, torch.Tensor] = {}
         self.weight_workspace_demand: dict[str, int] = {}
@@ -141,7 +153,11 @@ class MoonEPRuntime(MoonEPLifecycle):
             return
         local = tuple((executor.experts, executor.replica_capacity, executor.top_k,
                        executor.token_dedup, executor.forward_ratio, executor.backward_ratio,
-                       getattr(getattr(executor, "chunked", None), "chunk_rows", 0)) for executor in self.executors)
+                       getattr(getattr(executor, "chunked", None), "chunk_rows", 0),
+                       self.compact_weight_slots, getattr(executor, "gradient_accumulation_fusion", None),
+                       self.home_weight_mode, self.release_w_workspace,
+                       os.environ.get("HP_MOONEP_FUSED_WGRAD"), os.environ.get("HP_MOONEP_REPLICA_PREFETCH", "1"))
+                      for executor in self.executors)
         gathered = [None] * first.ranks
         dist.all_gather_object(gathered, local, group=first.group)
         if any(other != local for other in gathered):
@@ -190,35 +206,50 @@ class MoonEPRuntime(MoonEPLifecycle):
         """在 FSDP 参数梯度就绪后等通信包；例如 B7 的远程 dW 到达再执行 RS。"""
         return wait_home_gradients(packet)
 
-    def _ensure_slots(self, gate_up: torch.Tensor, down: torch.Tensor) -> None:
+    def _ensure_slots(self, gate_up: torch.Tensor, down: torch.Tensor, capacity: int | None = None) -> None:
         """首次计算只分配一张最终表；例如 BF16 计算不会按 FSDP 深度预留空槽。"""
         if not self.slots:
             if len({id(executor.weight_group) for executor in self.executors}) != 1:
                 raise ValueError("共享权重表要求所有专家层共用同一 EP 权重通信域")
             self.stream = (communication_stream(self.executors[0].weight_group, gate_up.device)
                            if gate_up.device.type == "npu" else None)
-            self.slots = [self._new_slot(gate_up, down)]
+            self.slots = [self._new_slot(gate_up, down, capacity if self.compact_weight_slots else None)]
         slot = self.slots[0]
         if (slot.gate_up.shape[1:] != gate_up.shape[1:] or slot.down.shape[1:] != down.shape[1:]
                 or slot.gate_up.dtype != gate_up.dtype or slot.gate_up.device != gate_up.device):
             raise ValueError("共享专家表槽要求所有专家层的H/I、计算dtype和设备相同")
 
-    def _new_slot(self, gate_up: torch.Tensor, down: torch.Tensor) -> _WeightTableSlot:
+    def _new_slot(self, gate_up: torch.Tensor, down: torch.Tensor, capacity: int | None = None) -> _WeightTableSlot:
         """按实际在途请求增加一张专家表；例如 B7 占用首槽时 B6 的 hook 获得第二槽。"""
         # 长期表使用既有 EP 通信流的分配池，减少与 C 激活和交叉熵临时量的交错分配。
+        capacity = self.capacity if capacity is None else capacity
         with torch.npu.stream(self.stream) if self.stream is not None else nullcontext():
-            return _WeightTableSlot(gate_up.new_empty((self.capacity, *gate_up.shape[1:])),
-                         down.new_empty((self.capacity, *down.shape[1:])))
+            return _WeightTableSlot(gate_up.new_empty((capacity, *gate_up.shape[1:])),
+                                    down.new_empty((capacity, *down.shape[1:])))
 
     def _acquire_home_slot(self, key: ExecutionKey, gate_up: torch.Tensor, down: torch.Tensor) -> _WeightTableSlot:
         """Reserve a table for layout work or reuse the same pending reservation."""
-        self._ensure_slots(gate_up, down)
+        capacity = (min(self.capacity, ((len(self.executions[key][1].group_counts) + 3) // 4) * 4)
+                    if self.compact_weight_slots else None)
+        self._ensure_slots(gate_up, down, capacity)
         if key in self.home_layout_slots:
             return self.home_layout_slots[key]
         slot = next((item for item in self.slots if item.key is None), None)
         if slot is None:
-            slot = self._new_slot(self.slots[0].gate_up, self.slots[0].down)
+            capacity = (min(self.capacity, ((len(self.executions[key][1].group_counts) + 3) // 4) * 4)
+                        if self.compact_weight_slots else None)
+            slot = self._new_slot(self.slots[0].gate_up, self.slots[0].down, capacity)
             self.slots.append(slot)
+        if self.compact_weight_slots:
+            active = len(self.executions[key][1].group_counts)
+            if slot.gate_up.shape[0] < active:
+                # Retain a small high-water bucket; last readers hold old storage
+                # through record_stream, never resize a tensor with queued users.
+                capacity = min(self.capacity, ((active + 3) // 4) * 4)
+                replacement = self._new_slot(gate_up, down, capacity)
+                self.slots[next(index for index, value in enumerate(self.slots) if value is slot)] = replacement
+                slot = replacement
+                self.statistics["weight_table_growths"] += 1
         slot.key = key
         self.home_layout_slots[key] = slot
         return slot
@@ -236,8 +267,14 @@ class MoonEPRuntime(MoonEPLifecycle):
             Its next writer waits for W's last scratch reader, independently
             of C's last reader of the final table. All waits stay on device.
         """
+        if getattr(self, "home_weight_views", False):
+            return
         gate_up, down = executor.read_weights()
         if gate_up.device.type not in ("cpu", "npu") or (gate_up.is_contiguous() and down.is_contiguous()):
+            return
+        if self.compact_weight_slots and key not in self.executions:
+            # The original route compiler has not exported its replica demand.
+            # Defer layout until prepare() knows the exact final-table capacity.
             return
         slot = self._acquire_home_slot(key, gate_up, down)
         if slot.home_layout_key == key:
@@ -249,7 +286,12 @@ class MoonEPRuntime(MoonEPLifecycle):
         with torch.npu.stream(self.home_layout_stream) if self.home_layout_stream is not None else nullcontext():
             if self.home_layout_stream is not None and slot.home_layout_read_done is not None:
                 self.home_layout_stream.wait_event(slot.home_layout_read_done)
-            if slot.home_gate_up is None or slot.home_gate_up.shape != gate_up.shape:
+            if self.compact_weight_slots:
+                if self.home_layout_stream is not None and slot.compute_read_done is not None:
+                    self.home_layout_stream.wait_event(slot.compute_read_done)
+                slot.home_gate_up = slot.gate_up[:gate_up.shape[0]]
+                slot.home_down = slot.down[:down.shape[0]]
+            elif slot.home_gate_up is None or slot.home_gate_up.shape != gate_up.shape:
                 slot.home_gate_up, slot.home_down = (
                     torch.empty_like(gate_up, memory_format=torch.contiguous_format),
                     torch.empty_like(down, memory_format=torch.contiguous_format),
@@ -284,11 +326,15 @@ class MoonEPRuntime(MoonEPLifecycle):
         if key in self.weight_leases:
             self.statistics["weight_lease_hits"] += 1
             return self.weight_leases[key]
+        if self.home_weight_views:
+            return self._prepare_weight_views(key)
         executor, plan = self.executions[key]
         # 原生模块hook或预取post已恢复home；本函数只管理副本和计算表。
         if not self.slots:
             gate_up, down = executor.read_weights()
-            self._ensure_slots(gate_up, down)
+            capacity = (min(self.capacity, ((len(plan.group_counts) + 3) // 4) * 4)
+                        if self.compact_weight_slots else None)
+            self._ensure_slots(gate_up, down, capacity)
         if self.weight_workspace_busy:
             raise RuntimeError("权重工作区仍在提交或上次物化失败，不能覆盖可能在途的EP输入")
         gate_up, down = executor.read_weights()
@@ -323,8 +369,9 @@ class MoonEPRuntime(MoonEPLifecycle):
                 self.stream.wait_event(slot.home_layout_ready)
             active = len(plan.group_counts)
             target_gate_up, target_down = slot.gate_up[:active], slot.down[:active]
-            target_gate_up[:plan.home_count].copy_(source_gate_up)
-            target_down[:plan.home_count].copy_(source_down)
+            if not (self.compact_weight_slots and prepared):
+                target_gate_up[:plan.home_count].copy_(source_gate_up)
+                target_down[:plan.home_count].copy_(source_down)
             if sum(plan.weight_recv):
                 target_gate_up[plan.home_count:].copy_(remote_gate_up)
                 target_down[plan.home_count:].copy_(remote_down)
@@ -340,8 +387,75 @@ class MoonEPRuntime(MoonEPLifecycle):
         # Exchange scratch has only EP readers, all ordered before ready.
         # Retaining it until C consumes the table would pin prefetch-depth copies.
         del keepalive
+        if getattr(self, "release_w_workspace", False):
+            self.weight_workspace.clear()
         lease = _WeightLease(slot, target_gate_up, target_down, ready)
         self.weight_workspace_busy = False
+        self.weight_leases[key] = lease
+        self.statistics["materializations"] += 1
+        self.statistics["max_live_weight_leases"] = max(
+            self.statistics["max_live_weight_leases"], len(self.weight_leases))
+        return lease
+
+    def _prepare_weight_views(self, key: ExecutionKey) -> _WeightLease:
+        """Borrow homes and materialize only remote matrices in their physical layout."""
+        executor, plan = self.executions[key]
+        gate_up, down = executor.read_weights()
+        if self.stream is None and gate_up.device.type == "npu":
+            self.stream = communication_stream(executor.weight_group, gate_up.device)
+        current = torch.npu.current_stream(gate_up.device) if self.stream is not None else None
+        if self.weight_workspace_busy:
+            raise RuntimeError("weight workspace still belongs to an incomplete materialization")
+        self.weight_workspace_busy = self.stream is not None
+        received = sum(plan.weight_recv)
+        capacity = min(executor.replica_capacity, ((received + 3) // 4) * 4)
+        slot = next((item for item in self.slots if item.key is None), None)
+        context = torch.npu.stream(self.stream) if self.stream is not None else nullcontext()
+        with context:
+            if self.stream is not None:
+                self.stream.wait_stream(current)
+            if slot is not None and slot.compute_read_done is not None and self.stream is not None:
+                self.stream.wait_event(slot.compute_read_done)
+            if slot is not None and any(target.shape[1:] != source.shape[1:] or target.dtype != source.dtype
+                                         or target.device != source.device
+                                         for target, source in ((slot.gate_up, gate_up), (slot.down, down))):
+                raise ValueError("shared weight views require uniform expert dimensions, dtype, and device")
+            if slot is None or slot.gate_up.shape[0] < received:
+                matrices = []
+                for value in (gate_up, down):
+                    transposed = value.stride(-2) == 1
+                    shape = tuple(reversed(value.shape[1:])) if transposed else tuple(value.shape[1:])
+                    buffer = value.new_empty((capacity, *shape))
+                    matrices.append(buffer.transpose(1, 2) if transposed else buffer)
+                if slot is None:
+                    slot = _WeightTableSlot(matrices[0], matrices[1])
+                    self.slots.append(slot)
+                else:
+                    slot.gate_up, slot.down = matrices
+            slot.key = key
+            if self.stream is not None and sum(plan.weight_send):
+                gate_up.record_stream(self.stream)
+                down.record_stream(self.stream)
+            remote_gate, remote_down, keepalive = self._exchange_weights(executor, plan, gate_up, down)
+            if received:
+                slot.gate_up[:received].copy_(remote_gate)
+                slot.down[:received].copy_(remote_down)
+            ready = None
+            if self.stream is not None:
+                ready = torch.npu.Event()
+                ready.record(self.stream)
+        del keepalive
+        self.weight_workspace_busy = False
+        if self.release_w_workspace:
+            self.weight_workspace.clear()
+        if getattr(self, "home_weight_mode", "1") == "2":
+            rows = (sum(plan.group_counts[:plan.home_count]), sum(plan.group_counts[plan.home_count:]))
+            weights = tuple(GroupedWeightViews(parts=(home, remote[:received]), rows_per_part=rows)
+                            for home, remote in ((gate_up, slot.gate_up), (down, slot.down)))
+        else:
+            weights = tuple(GroupedWeightViews(tuple(home.unbind(0)) + tuple(remote[:received].unbind(0)))
+                            for home, remote in ((gate_up, slot.gate_up), (down, slot.down)))
+        lease = _WeightLease(slot, *weights, ready)
         self.weight_leases[key] = lease
         self.statistics["materializations"] += 1
         self.statistics["max_live_weight_leases"] = max(
@@ -372,7 +486,8 @@ class MoonEPRuntime(MoonEPLifecycle):
             if elements > limit:
                 self.statistics["weight_workspace_oversized"] += 1
             return template.new_empty(elements)
-        demand = max(elements, min(limit, self.weight_workspace_demand.get(role, 0)))
+        demand = (elements if getattr(self, "release_w_workspace", False)
+                  else max(elements, min(limit, self.weight_workspace_demand.get(role, 0))))
         self.weight_workspace_demand[role] = demand
         buffer = self.weight_workspace.get(role)
         if buffer is not None and (buffer.dtype != template.dtype or buffer.device != template.device
@@ -421,7 +536,7 @@ class MoonEPRuntime(MoonEPLifecycle):
         remote_down = remote[:, gate_up_width:].reshape(received, *down.shape[1:])
         return remote_gate_up, remote_down, [packed, remote]
 
-    def consume(self, key: ExecutionKey) -> tuple[torch.Tensor, torch.Tensor]:
+    def consume(self, key: ExecutionKey) -> tuple[GroupedWeights, GroupedWeights]:
         """在真正消费流等待当前ready；例如已预取K6无需再执行AG或EP。"""
         lease = self.require_weight_lease(key)
         if self.stream is not None:
@@ -571,12 +686,20 @@ def launch_home_gradients(gate_up: torch.Tensor, down: torch.Tensor, plan: Execu
         可以先交给 autograd 的两份本地 home 梯度，以及等待 FSDP 归并的通信包。
     """
     home_gate_up, home_down = local_home_gradients(gate_up, down, plan)
+    packet = launch_replica_gradients(gate_up[plan.home_count:], down[plan.home_count:], plan, group, stream)
+    return home_gate_up, home_down, packet
+
+
+@torch.no_grad()
+def launch_replica_gradients(gate_up: torch.Tensor, down: torch.Tensor, plan: ExecutionPlan,
+                             group: Any, stream: Any) -> _GradientPacket | None:
+    """Return only replica dW; home accumulators never enter the communication payload."""
     if not plan.any_migration:
-        return home_gate_up, home_down, None
+        return None
     sent = sum(plan.weight_send)
     gate_up_width = gate_up.shape[1] * gate_up.shape[2]
     down_width = down.shape[1] * down.shape[2]
-    packed = pack_expert_rows(gate_up[plan.home_count:], down[plan.home_count:], None)
+    packed = pack_expert_rows(gate_up, down, None)
     returned = packed.new_empty((sent, gate_up_width + down_width))
     if stream is not None:
         # G 必须在 C 完成打包后读取；通信使用梯度域既有流，避免新增流割裂分配池。
@@ -586,7 +709,7 @@ def launch_home_gradients(gate_up: torch.Tensor, down: torch.Tensor, plan: Execu
             work = dist.all_to_all_single(returned, packed, plan.weight_send, plan.weight_recv,
                                          group=group, async_op=True)
     packet = _GradientPacket(returned, packed, plan, gate_up.shape, down.shape, work)
-    return home_gate_up, home_down, packet
+    return packet
 
 
 @torch.no_grad()
@@ -662,6 +785,8 @@ class _ExpertFunction(torch.autograd.Function):
             with torch.profiler.record_function("moonep::return_gradients"):
                 hg, hd = return_home_gradients(dg, dd, plan, executor.gradient_group)
         else:
+            if home_gradients is None:
+                raise RuntimeError("expert backward did not publish complete home gradients")
             hg, hd = home_gradients
         if (hg.shape, hd.shape) != ctx.shapes:
             raise RuntimeError("MoonEP完整归属梯度与真实参数输入形状不一致")
@@ -747,21 +872,47 @@ class _MoEFunction(torch.autograd.Function):
                             if executor.ranks > 1 else packed)
         del expert_dx, received, packed
         with torch.profiler.record_function("moonep::weight_gradients"):
-            dd = grouped_weight_grad(intermediate, derivative, boundaries)
-            dg = grouped_weight_grad(x, du, boundaries)
-            if scheduler is None:
-                hg, hd = return_home_gradients(dg, dd, plan, executor.gradient_group)
+            fusion = scheduler is not None and executor.gradient_extension.uses_accumulated_grad(scheduler.hsdp_state)
+            if fusion:
+                extension = executor.gradient_extension
+                targets = extension.accumulation_buffers(scheduler.hsdp_state)
+                home_rows = sum(plan.group_counts[:plan.home_count])
+                for target, (_parameter, transposed), left, right in zip(
+                        targets, extension._layouts(scheduler.hsdp_state), (x, intermediate), (du, derivative)):
+                    grouped_weight_grad_add(target, left[:home_rows], right[:home_rows],
+                                            boundaries[:plan.home_count], transposed=transposed)
+                replica_boundaries = boundaries[plan.home_count:] - home_rows
+                if replica_boundaries.numel():
+                    dg = grouped_weight_grad(x[home_rows:], du[home_rows:], replica_boundaries)
+                    dd = grouped_weight_grad(intermediate[home_rows:], derivative[home_rows:], replica_boundaries)
+                else:
+                    dg = x.new_empty((0, *gate_up.shape[1:]))
+                    dd = x.new_empty((0, *down.shape[1:]))
+                stream = runtime.gradient_stream(executor, x.device) if plan.any_migration else None
+                packet = launch_replica_gradients(dg, dd, plan, executor.gradient_group, stream)
+                if packet is not None:
+                    extension.pending.append(packet)
+                    runtime.statistics["gradient_exchanges"] += 1
+                runtime.statistics["home_wgrad_add_calls"] += 2
+                hg = hd = None
             else:
-                hg, hd = executor.gradient_extension.start(dg, dd, plan)
+                dd = grouped_weight_grad(intermediate, derivative, boundaries)
+                dg = grouped_weight_grad(x, du, boundaries)
+                if scheduler is None:
+                    hg, hd = return_home_gradients(dg, dd, plan, executor.gradient_group)
+                else:
+                    hg, hd = executor.gradient_extension.start(dg, dd, plan)
         runtime.release(key)
         if ready is not None:
             # This event covers token return only, before the later replica G.
             torch.npu.current_stream(returned.device).wait_event(ready)
         dx = returned.new_zeros(ctx.input_shape).reshape(-1, returned.shape[-1])
         dx.index_add_(0, source_rows, returned)
-        if (hg.shape, hd.shape) != ctx.shapes:
+        if not fusion and (hg.shape, hd.shape) != ctx.shapes:
             raise RuntimeError("MoonEP完整归属梯度与真实参数输入形状不一致")
         runtime.complete(key)
+        if fusion:
+            executor.gradient_extension.notify_accumulated(scheduler)
         return dx.reshape(ctx.input_shape), hg, hd, None, None, None
 
 
@@ -774,10 +925,12 @@ class MoonEPExecutor:
                  prefetch_depth: int = 1,
                  token_dedup: bool = False,
                  forward_ratio: float | None = None,
-                 backward_ratio: float | None = None) -> None:
+                 backward_ratio: float | None = None,
+                 gradient_accumulation_fusion: bool | None = None) -> None:
         """绑定布局读取器；例如 EP=4 时按规划同步分发并回传 token。"""
         if ep_size < 1 or num_experts < 1 or num_experts % ep_size or not 0 < top_k <= num_experts:
             raise ValueError("非法EP、专家数或top-k")
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.owner, self.read_weights = owner, read_weights
         self.group, self.ranks, self.experts, self.top_k = ep_group, ep_size, num_experts, top_k
         self.rank = dist.get_rank(ep_group) if ep_size > 1 else 0
@@ -858,6 +1011,10 @@ class MoonEPExecutor:
                                 geometry=geometry,
                                 chunk_rows=None if self.chunked is None else self.chunked.chunk_rows,
                                 graphs=self.runtime.planning_graphs)
+        self.runtime.statistics["max_selection_rows"] = max(
+            self.runtime.statistics["max_selection_rows"], sum(plan.token_send))
+        self.runtime.statistics["max_received_rows"] = max(
+            self.runtime.statistics["max_received_rows"], sum(plan.token_recv))
         self.runtime.statistics["planner_fallbacks"] += int(plan.planner_fallback)
         self.runtime.statistics["moved_entries"] += plan.metrics[1]
         self.runtime.statistics["peak_copies"] = max(self.runtime.statistics["peak_copies"], plan.metrics[2])
