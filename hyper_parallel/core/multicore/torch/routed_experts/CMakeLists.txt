@@ -11,7 +11,10 @@ if(NOT EXISTS "${ROUTED_KERNEL_LIBRARY}")
     message(FATAL_ERROR "ROUTED_KERNEL_LIBRARY must point to the explicitly built independent kernel library")
 endif()
 add_library(hyper_parallel_routed_experts_torch SHARED
-    ../csrc/routed_experts.cpp ../csrc/routed_metadata.cpp ../csrc/routed_group_transport.cpp)
+    ../csrc/routed_experts.cpp ../csrc/routed_gradient.cpp ../csrc/routed_combine.cpp
+    ../csrc/routed_combine_backward.cpp ../csrc/routed_activation.cpp ../csrc/routed_forward.cpp
+    ../csrc/routed_metadata.cpp ../csrc/routed_backward.cpp ../csrc/routed_ordered_sum.cpp
+    ../csrc/routed_group_transport.cpp)
 hp_apply_torch_cxx_standard(hyper_parallel_routed_experts_torch "${TORCH_CXX_STANDARD}")
 target_compile_definitions(hyper_parallel_routed_experts_torch PRIVATE
     _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX11_ABI} CURRENT_VERSION=VERSION_NEWEST)

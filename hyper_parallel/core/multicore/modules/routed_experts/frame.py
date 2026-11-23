@@ -1,0 +1,120 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Prepared storage and metadata retained through one native compute submission."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from hyper_parallel.core.multicore.modules.routed_experts.readiness import ExpertReadiness, ProducerFence
+
+
+@dataclass(frozen=True)
+class ExpertState:
+    """Retain forward X/Z; the owner rebinds matrix pointers for backward."""
+
+    x: torch.Tensor
+    preact: torch.Tensor
+
+
+@dataclass
+class LinearWork:
+    """Keep one GEMM's operands, output, metadata and fresh publication cells alive."""
+
+    owner: object
+    x: torch.Tensor
+    weights: tuple[torch.Tensor, ...]
+    weight_table: torch.Tensor | None
+    result: torch.Tensor
+    tasks: torch.Tensor | None
+    config: torch.Tensor | None
+    schedule_workspace: torch.Tensor
+    initialized: Any
+    transposed: bool
+    cores: int
+    ready: ExpertReadiness | None
+    submitted: bool = False
+
+
+@dataclass
+class GradientWork:
+    """Keep complete expert dW outputs; mapped views may alias real g or the peer send buffer."""
+
+    owner: object
+    x: torch.Tensor
+    dy: torch.Tensor
+    result: torch.Tensor | tuple[torch.Tensor, ...]
+    tasks: torch.Tensor | None
+    config: torch.Tensor | None
+    initialized: Any
+    cores: int
+    submitted: bool = False
+    output_table: torch.Tensor | None = None
+    transposed: bool = False
+
+
+@dataclass
+class ForwardWork:
+    """Own F/replay storage; only state.x/state.preact survive as saved activations."""
+
+    owner: object
+    activation: torch.Tensor
+    output: torch.Tensor
+    ready: ExpertReadiness | None
+    state: ExpertState
+    up: LinearWork
+    down: LinearWork
+    submitted: bool = False
+
+
+@dataclass
+class BackwardWork:
+    """Own B operands and one-shot compute work through their final device readers.
+
+    Standalone A aliases dz; pipeline A is separate. By default da and dx share
+    project storage. With W2-first derivative reuse, dx consumes phase-local dv
+    only after its dA/dW2 readers. Mapped dW writes directly to real FP32 g or
+    disjoint replica send slices; other modes own independent dW outputs.
+    """
+
+    owner: object
+    dv: torch.Tensor
+    state: ExpertState
+    da: torch.Tensor
+    dz: torch.Tensor
+    activation: torch.Tensor
+    output: torch.Tensor
+    ready: ExpertReadiness | None
+    down_gradient: torch.Tensor | tuple[torch.Tensor, ...]
+    gate_gradient: torch.Tensor | tuple[torch.Tensor, ...]
+    da_work: LinearWork
+    dx_work: LinearWork
+    down_work: GradientWork
+    gate_work: GradientWork
+    submitted: bool = False
+    pipeline: bool = False
+    early_experts: torch.Tensor | None = None
+    gradient_ready: ProducerFence | None = None
+    consume_preactivation: bool = False
+    w2_before_input_grad: bool = False
+    consume_derivative: bool = False
+
+    @property
+    def dx(self) -> torch.Tensor:
+        """Return the already allocated input-gradient view."""
+        return self.output
