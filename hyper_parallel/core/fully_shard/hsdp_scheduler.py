@@ -13,9 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """HSDP scheduler"""
+from contextlib import nullcontext
 import functools
 import inspect
-from typing import Any, Callable, List, Mapping, Optional, ParamSpec, Tuple, TypeVar, Union
+import os
+import weakref
+from typing import Any, Callable, List, Mapping, Optional, ParamSpec, Protocol, Tuple, TypeVar, Union
 
 import torch
 from torch import nn
@@ -23,7 +26,9 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hook_function import PostBackwardFunction
+from hyper_parallel.core.fully_shard.reduce_buffer import ReduceBufferPool
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
     get_managed_modules_parameters,
@@ -46,6 +51,19 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
+class FSDPAllGatherExtension(Protocol):
+    """Notify consumers during FSDP-owned parameter restoration."""
+
+    def fsdp_pre_forward(self, state: Any, args: tuple, kwargs: dict) -> None:
+        """Optionally inspect cast forward inputs before restoring parameters."""
+
+    def fsdp_pre_all_gather(self, state: Any) -> None:
+        """Observe submission of an actual parameter all-gather."""
+
+    def fsdp_post_unshard(self, state: Any) -> None:
+        """Consume complete parameters, including restores that reuse them."""
+
+
 def _dynamo_disable(func: Callable[_P, _R]) -> Callable[_P, _R]:
     """Disable Dynamo tracing while an FSDP runtime hook executes."""
 
@@ -65,13 +83,37 @@ class ParamGroupCommCtx:
     def __init__(self) -> None:
         self.pre_param_group = None
         self.all_reduce_param_group = None
-        self.comm_handle = None
 
 
-class HSDPSchedulerContext:
+class HSDPReductionPipeline:
+    """Own one ordered reduction queue and the stream that consumes its gradients."""
+
+    def __init__(self, stream: Any = None) -> None:
+        """Use the caller stream by default, or a dedicated preparation stream."""
+        self.stream = stream
+        self.last_state = None
+        self.reduce_input_pool = ReduceBufferPool(int(os.environ.get("HP_FSDP_RS_POOL_BYTES", "0")))
+        self.pre_reduce_scatter_params = []
+        self.pre_all_reduce_groups = []
+        self.pending_all_reduce_groups = []
+        self.param_group_comm_ctx = ParamGroupCommCtx()
+
+    def reset(self) -> None:
+        """Release completed iteration bookkeeping without changing stream ownership."""
+        self.pre_reduce_scatter_params.clear()
+        self.pre_all_reduce_groups.clear()
+        self.pending_all_reduce_groups.clear()
+        self.param_group_comm_ctx.pre_param_group = None
+        self.param_group_comm_ctx.all_reduce_param_group = None
+        self.last_state = None
+
+
+class HSDPSchedulerContext(HSDPReductionPipeline):
     """Share scheduler and backward-pipeline state within one HSDP module tree."""
 
     def __init__(self) -> None:
+        super().__init__()
+        self.deferred_pipeline = None
         self.is_last_backward: bool = True
         self.root_module = None
         # Compile tracing may enter the root more than once; initialize shared
@@ -85,13 +127,7 @@ class HSDPSchedulerContext:
         self.all_hsdp_schedulers = []
         # Parameter FQNs are initialized once after all schedulers share this context.
         self._param_fqn_initialized = False
-        # Backward pipeline queues shared only by schedulers in this module tree.
-        self.pre_reduce_scatter_params = []
-        self.pre_all_reduce_params = []
-        self.pre_direct_all_reduce_grads = []
-        self.pre_all_reduce_groups = []
-        self.pending_all_reduce_groups = []
-        self.param_group_comm_ctx = ParamGroupCommCtx()
+        self.all_gather_post_stream = None
 
 
 class HSDPSchedulerV2:
@@ -144,6 +180,14 @@ class HSDPSchedulerV2:
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
         self._backup_forward_fetch = None
+        # 自定义反向可能先返回输入梯度；输入边就绪不代表参数梯度已累积。
+        self._param_grad_gate = False
+        self._param_grad_expected = set()
+        self._param_grad_ready = set()
+        self._param_grad_handles = {}
+        self._param_grad_input_done = False
+        self._pre_reduce_hook: Optional[Callable[[Any], None]] = None
+        self.early_release_rs_input = os.environ.get("HP_FSDP_EARLY_RS_INPUT", "1") == "1"
         # Flag to identify root module.
         self._is_root = True
         # module and its all sub-modules share one same 'HSDPSchedulerContext'
@@ -221,14 +265,9 @@ class HSDPSchedulerV2:
         """Reset scheduler bookkeeping after a completed iteration."""
         self.scheduler_ctx.root_bp_state = False
         self.scheduler_ctx.post_backward_final_callback_queued = False
-        self.scheduler_ctx.pre_reduce_scatter_params.clear()
-        self.scheduler_ctx.pre_all_reduce_params.clear()
-        self.scheduler_ctx.pre_direct_all_reduce_grads.clear()
-        self.scheduler_ctx.pre_all_reduce_groups.clear()
-        self.scheduler_ctx.pending_all_reduce_groups.clear()
-        self.scheduler_ctx.param_group_comm_ctx.pre_param_group = None
-        self.scheduler_ctx.param_group_comm_ctx.all_reduce_param_group = None
-        self.scheduler_ctx.param_group_comm_ctx.comm_handle = None
+        for pipeline in (self.scheduler_ctx, self.scheduler_ctx.deferred_pipeline):
+            if pipeline is not None:
+                pipeline.reset()
         self.scheduler_state = None
         if self._fsdp_group_post_pending is not None:
             self._fsdp_group_post_pending.clear()
@@ -250,6 +289,14 @@ class HSDPSchedulerV2:
         """Forward pre hook to unsharded parameter for forward process."""
         logger.debug("hook=forward_pre enter module=%s", self.hsdp_state)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            # A checkpoint may wrap the expert unit itself. Its parameters were
+            # restored by pre-backward, but replay still needs its invocation
+            # inputs and the extension completion chain, without another AG.
+            extension = getattr(self.hsdp_state, "all_gather_extension", None)
+            prepare = getattr(extension, "fsdp_pre_forward", None)
+            if prepare is not None:
+                prepare(self.hsdp_state, args, kwargs)
+                self.hsdp_state.complete_unshard()
             logger.debug("hook=forward_pre skip module=%s reason=pre_backward", self.hsdp_state)
             return args, kwargs
         if self.scheduler_ctx.root_bp_state:
@@ -272,6 +319,7 @@ class HSDPSchedulerV2:
                             )
                         submod_scheduler.scheduler_ctx = tree_ctx
                         submod_scheduler.hsdp_state.scheduler_ctx = tree_ctx
+                        submod_scheduler.hsdp_state.reduction_pipeline = tree_ctx
                         if submod_scheduler.hsdp_state.param_group is not None:
                             submod_scheduler.hsdp_state.param_group.comm_ctx = tree_ctx.param_group_comm_ctx
                     submod_scheduler._is_root = submod_scheduler is self  # pylint: disable=protected-access
@@ -287,9 +335,15 @@ class HSDPSchedulerV2:
             cast_fn = functools.partial(cast_fp_tensor, self.mp_policy.param_dtype)
             args = apply_to_tensors(cast_fn, args)
             kwargs = apply_to_tensors(cast_fn, kwargs)
+        extension = getattr(self.hsdp_state, "all_gather_extension", None)
+        prepare = getattr(extension, "fsdp_pre_forward", None)
+        if prepare is not None:
+            prepare(self.hsdp_state, args, kwargs)
         with profiler_record(f"pre_forward unshard:{self.hsdp_state.module_name}"):
             logger.debug("hook=forward_pre action=unshard module=%s", self.hsdp_state)
             self.hsdp_state.unshard()
+        if self._param_grad_gate and not self.scheduler_ctx.root_bp_state:
+            self._arm_param_grad_gate()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
             with profiler_record(f"pre_forward prefetch:"
@@ -300,14 +354,26 @@ class HSDPSchedulerV2:
                     prefetch_state,
                 )
                 prefetch_state.prefetch()
+        for prefetch_cell in self.forward_prefetch_cells:
+            prefetch_cell.hsdp_scheduler.hsdp_state.complete_prefetch()
         return args, kwargs
 
     def _lazy_init_all_states(self):
         if self._is_root and self.scheduler_ctx.root_module is not None:
-            for submod_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
-                hsdp_state = submod_scheduler.hsdp_state
-                if hsdp_state:
-                    hsdp_state.lazy_init()
+            context = self.scheduler_ctx
+            if (self.device.type != "cpu" and any(scheduler._pre_reduce_hook is not None
+                                                  for scheduler in context.all_hsdp_schedulers)):
+                context.deferred_pipeline = HSDPReductionPipeline(
+                    torch.get_device_module(self.device).Stream(device=self.device))
+            for scheduler in context.all_hsdp_schedulers:
+                state = scheduler.hsdp_state
+                if state:
+                    state.reduction_pipeline = (context.deferred_pipeline
+                                                if scheduler._pre_reduce_hook is not None
+                                                and context.deferred_pipeline is not None else context)
+                    if state.param_group is not None:
+                        state.param_group.comm_ctx = state.reduction_pipeline.param_group_comm_ctx
+                    state.lazy_init()
 
     def _init_params_fqn(self):  # pylint: disable=W0212
         if not self._is_root or self.scheduler_ctx.root_module is None:
@@ -363,10 +429,9 @@ class HSDPSchedulerV2:
         """Backward pre hook to unsharded parameter for backward process."""
         logger.debug("hook=backward_pre enter module=%s", self.hsdp_state)
         self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
-        if self.reshard_after_forward:
-            with profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
-                logger.debug("hook=backward_pre action=unshard module=%s", self.hsdp_state)
-                self.hsdp_state.unshard()
+        with profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
+            logger.debug("hook=backward_pre action=unshard module=%s", self.hsdp_state)
+            self.hsdp_state.unshard()
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
             with profiler_record(f"pre_backward prefetch:"
@@ -378,14 +443,43 @@ class HSDPSchedulerV2:
                 )
                 prefetch_state.prefetch()
 
+        # Submit every AG before extension work can delay another submission.
+        for prefetch_cell in self.backward_prefetch_cells:
+            prefetch_state = prefetch_cell.hsdp_scheduler.hsdp_state
+            with profiler_record(f"post_backward prefetch:"
+                                 f"{prefetch_state.module_name}"):
+                prefetch_state.complete_prefetch()
+
     # pylint: disable=W0613
     def _hsdp_backward_hook(self, cell, grad_inputs, grad_outputs):
-        """Backward hook to shard parameter for optimizer process or saving memory."""
+        """Prepare and reduce ready parameter gradients on the FSDP-owned stream."""
         logger.debug("hook=backward_hook enter module=%s", self.hsdp_state)
         self.scheduler_state = FSDPSchedulerState.BACKWARD
+        pipeline = self.hsdp_state.reduction_pipeline
+        pipeline.last_state = self.hsdp_state
+        stream = pipeline.stream
+        device_module = torch.get_device_module(self.device)
+        if stream is not None:
+            stream.wait_stream(device_module.current_stream(self.device))
+            for param in self.hsdp_state.hsdp_params:
+                if not param.unsharded_param_buffers:
+                    continue
+                for tensor in (param.unsharded_grad_data, param.unsharded_accumulated_grad_data):
+                    if tensor is not None:
+                        if isinstance(tensor, DTensor):
+                            tensor = tensor.to_local()
+                        tensor.record_stream(stream)
         with profiler_record(f"post_backward:{self.hsdp_state.module_name}"):
-            logger.debug("hook=backward_hook action=post_backward module=%s", self.hsdp_state)
-            self.hsdp_state.post_backward()
+            with device_module.stream(stream) if stream is not None else nullcontext():
+                if self._pre_reduce_hook is not None:
+                    with torch.profiler.record_function("fsdp::gradient_extension"):
+                        self._pre_reduce_hook(self.hsdp_state)
+                self.hsdp_state.post_backward()
+                if stream is not None and self.early_release_rs_input:
+                    # Expert-only queues may not be drained until the next MoE
+                    # finishes. Retire inputs here, keeping outputs and AR order.
+                    for param in self.hsdp_state.hsdp_params:
+                        param.release_reduce_scatter_input()
         if self._fsdp_group_post_pending is not None:
             self._fsdp_group_post_pending.clear()
 
@@ -447,6 +541,37 @@ class HSDPSchedulerV2:
         """
         self.backward_prefetch_cells = hsdp_cell_list
 
+    def register_all_gather_extension(self, extension: FSDPAllGatherExtension) -> None:
+        """Register hooks on this unit's fixed FSDP restoration lifecycle.
+
+        Args:
+            extension: Notifications before all-gather and after parameter readiness.
+        """
+        if (not callable(getattr(extension, "fsdp_pre_all_gather", None))
+                or not callable(getattr(extension, "fsdp_post_unshard", None))):
+            raise ValueError("all-gather 扩展必须同时实现前置和后置 hook")
+        registered = self.hsdp_state.all_gather_extension
+        if registered is not None and registered is not extension:
+            raise ValueError("同一 FSDP 单元不能注册多个 all-gather 扩展")
+        self.hsdp_state.all_gather_extension = extension
+
+    def register_pre_reduce_hook(self, hook: Callable[[Any], None]) -> None:
+        """Register completion of asynchronous gradients before native reduction.
+
+        Args:
+            hook: Callback run after parameter accumulation, on FSDP's
+                reduction stream. The root backward joins it before applying grads.
+                Register before the first forward so the entire root shares this stream.
+        """
+        if self.scheduler_ctx.lazy_init_done:
+            raise RuntimeError("pre-reduce hooks must be registered before the first forward")
+        if not callable(hook):
+            raise ValueError("pre-reduce hook must be callable")
+        if self._pre_reduce_hook is not None:
+            raise ValueError("同一 FSDP 单元不能注册多个归约前 hook")
+        self._pre_reduce_hook = hook
+        self.enable_param_grad_gate()
+
     def _disable_forward_prefetch_for_recompute(self) -> None:
         """Temporarily disable forward prefetch during activation recompute."""
         self._backup_forward_fetch = self.forward_prefetch_cells
@@ -458,6 +583,56 @@ class HSDPSchedulerV2:
             return
         self.forward_prefetch_cells = self._backup_forward_fetch
         self._backup_forward_fetch = None
+
+
+    def _has_user_post_accumulate_hooks(self) -> bool:
+        """检查完整参数是否还有用户累积后钩子；例如后注册的裁剪应先于 FSDP 消费。
+
+        门控钩子可能排在用户钩子之前；存在后者时把本单元归约推迟至 root 收尾。
+        """
+        for parameter in self.hsdp_state.hsdp_params:
+            tensor = parameter.unsharded_param
+            hooks = tensor._post_accumulate_grad_hooks or {}
+            gate = self._param_grad_handles.get(id(tensor))
+            if hooks and (gate is None or len(hooks) != 1 or gate.id not in hooks):
+                return True
+        return False
+
+    def enable_param_grad_gate(self) -> None:
+        """为独立参数单元开启输入边与AccumulateGrad双条件门控。
+
+        Example:
+            自定义反向先交付输入梯度时，延迟归约直到本单元的参数梯度都已累积。
+        """
+        self._param_grad_gate = True
+
+    def _arm_param_grad_gate(self) -> None:
+        """为一次原始前向登记实际受管参数；每个参数需就绪一次。"""
+        parameters = [param.unsharded_param for param in self.hsdp_state.hsdp_params
+                      if param.unsharded_param.requires_grad]
+        self._param_grad_expected = {id(param) for param in parameters}
+        self._param_grad_ready = set()
+        self._param_grad_input_done = False
+        owner_ref = weakref.ref(self)
+
+        def notify(parameter: torch.Tensor) -> None:
+            """Avoid retaining the module tree through AccumulateGrad's C++ hook storage."""
+            owner = owner_ref()
+            if owner is not None:
+                owner._on_param_grad_ready(parameter)
+
+        for param in parameters:
+            identity = id(param)
+            if identity not in self._param_grad_handles:
+                self._param_grad_handles[identity] = param.register_post_accumulate_grad_hook(
+                    notify,
+                )
+
+    def _on_param_grad_ready(self, param) -> None:
+        """在真实参数累积之后重试被挂起的post-backward；例如第二矩阵触发RS。"""
+        self._param_grad_ready.add(id(param))
+        if self._param_grad_input_done:
+            self._backward_hook()
 
     def _register_post_backward_hook(self, args, kwargs):
         """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
@@ -529,6 +704,10 @@ class HSDPSchedulerV2:
             root_scheduler = self.scheduler_ctx.root_module.hsdp_scheduler
             Variable._execution_engine.queue_callback(root_scheduler._root_backward_hook)
         self.scheduler_ctx.root_bp_state = True
+        if self._param_grad_gate:
+            # 两个保留的前向可分别反向；本次不能沿用上次的参数就绪标志。
+            self._param_grad_ready = set()
+            self._param_grad_input_done = False
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
@@ -538,18 +717,27 @@ class HSDPSchedulerV2:
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
-            hsdp_scheduler._backward_hook()
-        # Keep pending gradient reductions in flight while unused parameter
-        # prefetches finish, rather than delaying their launch on those waits.
+            if getattr(hsdp_scheduler, "_param_grad_gate", False) is True:
+                hsdp_scheduler._backward_hook(force=True)
+            else:
+                hsdp_scheduler._backward_hook()
+        # Keep reductions in flight while unused prefetches finish.
         self._finalize_unused_prefetches()
         self.scheduler_ctx.root_bp_state = False
         with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
-            logger.debug(
-                "hook=root_backward_hook action=final_reduce module=%s",
-                self.hsdp_state,
-            )
-            self._finalize_comm_fusion_reductions()
-            self._finalize_per_param_reductions()
+            for pipeline in (self.scheduler_ctx, self.scheduler_ctx.deferred_pipeline):
+                if pipeline is None:
+                    continue
+                stream = pipeline.stream
+                device_module = torch.get_device_module(self.hsdp_state.device) if stream is not None else None
+                with device_module.stream(stream) if stream is not None else nullcontext():
+                    self._finalize_comm_fusion_reductions(pipeline)
+                    if pipeline.last_state is not None:
+                        self._finalize_per_param_reductions(pipeline.last_state)
+                if stream is not None:
+                    with torch.profiler.record_function("fsdp::gradient_reduce_join"):
+                        device_module.current_stream(self.hsdp_state.device).wait_stream(stream)
+                pipeline.last_state = None
             self.launch_tp_replicate_reduce_and_apply()
         # BACKWARD only deduplicates hooks within one autograd execution;
         # accumulated no-sync gradients must outlive this state reset.
@@ -576,6 +764,7 @@ class HSDPSchedulerV2:
                         context.allgather_handle.wait()
                         context.allgather_handle = None
                     context.allgather_output = None
+                    context.allgather_input = None
                     if state.is_shard and param.shard_world_size > 1:
                         param.free_unsharded_param()
             if state.param_group is not None:
@@ -591,6 +780,12 @@ class HSDPSchedulerV2:
                         result.all_gather_input = None
                         result.all_gather_output = None
                         bucket.all_gather_result = None
+            if state.is_shard:
+                # Retired speculative gathers must not suppress the next AG.
+                # Preserve these flags on any failed wait or an active full view.
+                state._all_gather_started = False
+                state._prefetch_pending = False
+                state._unshard_event = None
 
     def check_state_prefetch_handles_consumed(self) -> None:
         """Check that all parameters in the module tree consumed their prefetch work.
@@ -621,9 +816,9 @@ class HSDPSchedulerV2:
                 "according to the model's actual execution order."
             )
 
-    def _finalize_comm_fusion_reductions(self) -> None:
+    def _finalize_comm_fusion_reductions(self, pipeline: HSDPReductionPipeline) -> None:
         """Drain the comm_fusion=True RS/AR pipeline."""
-        comm_ctx = self.scheduler_ctx.param_group_comm_ctx
+        comm_ctx = pipeline.param_group_comm_ctx
         if comm_ctx.all_reduce_param_group is not None:
             logger.debug(
                 "hook=root_backward_hook wait=comm_fusion_all_reduce module=%s",
@@ -642,13 +837,13 @@ class HSDPSchedulerV2:
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_save_grad()
             comm_ctx.all_reduce_param_group = None
 
-    def _finalize_per_param_reductions(self) -> None:
+    def _finalize_per_param_reductions(self, state: Any) -> None:
         """Drain the module-tree-local comm_fusion=False RS/AR queues."""
         # A fused root may own non-fused children, so always drain the tree queues.
-        last_all_reduce_groups = self.hsdp_state._wait_prev_reduce_scatter()
-        self.hsdp_state._wait_prev_reduce_scatter_without_all_reduce()
-        self.hsdp_state._issue_prev_fused_all_reduce(last_all_reduce_groups)
-        self.hsdp_state.wait_and_split_all_reduce_work_groups()
+        last_all_reduce_groups = state._wait_prev_reduce_scatter()
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        state._issue_prev_fused_all_reduce(last_all_reduce_groups)
+        state.wait_and_split_all_reduce_work_groups()
 
     def launch_tp_replicate_reduce_and_apply(self) -> None:
         """Run final TP replicate reductions and apply gradients for all states."""
@@ -667,16 +862,26 @@ class HSDPSchedulerV2:
                     reduced_grad,
                     hsdp_state.reduce_op_type,
                 )
+                if reduced_grad.device.type != "cpu":
+                    reduced_grad.record_stream(
+                        torch.get_device_module(reduced_grad.device).current_stream(reduced_grad.device))
                 need_synchronize = hsdp_param.apply_reduced_grad(reduced_grad) or need_synchronize
                 hsdp_param.clear_all_reduce_output()
                 hsdp_param.clear_reduce_scatter_output()
             hsdp_state._sync_current_stream_if_needed(need_synchronize)
 
     @_dynamo_disable
-    def _backward_hook(self):
+    def _backward_hook(self, force: bool = False):
         """Execute backward hook."""
         if self.scheduler_state == FSDPSchedulerState.BACKWARD:
             return
+        if self._param_grad_gate and not force:
+            self._param_grad_input_done = True
+            if not self._param_grad_expected.issubset(self._param_grad_ready):
+                return
+            # 本门控可能先于用户 post_accumulate 钩子执行；root force 才能安全消费 .grad。
+            if self._has_user_post_accumulate_hooks():
+                return
         self._hsdp_backward_hook(self.cell, None, None)
 
     @staticmethod

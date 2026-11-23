@@ -19,7 +19,8 @@ requires_grad=False tensors, the requires_grad attribute is preserved correctly
 after passing through PostBackwardFunction.apply.
 """
 # pylint: disable=W0212
-import os
+from contextlib import contextmanager
+from collections.abc import Iterator
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -29,17 +30,126 @@ from unittest.mock import MagicMock, patch
 # pylint: disable=C0413
 import torch
 from torch import nn
+from hyper_parallel.core.fully_shard.api import _UnshardHandle
 from hyper_parallel.core.fully_shard.hsdp_param import AllGatherCommCtx, HSDPParamV2
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_scheduler import (
+    HSDPReductionPipeline, HSDPSchedulerContext, HSDPSchedulerV2,
+)
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2
 from hyper_parallel.core.fully_shard.param_group import AllGatherResult
+from tests.common.mark_utils import arg_mark
 
 
 def _make_scheduler_stub() -> HSDPSchedulerV2:
     """Create a minimal HSDPSchedulerV2 stub that can call _register_post_backward_hook."""
     scheduler = object.__new__(HSDPSchedulerV2)
     scheduler.scheduler_ctx = HSDPSchedulerContext()
+    scheduler._param_grad_gate = False
+    scheduler._pre_reduce_hook = None
+    scheduler.early_release_rs_input = False
+    scheduler.device = torch.device("cpu")
+    scheduler._param_grad_expected = set()
+    scheduler._param_grad_ready = set()
+    scheduler._param_grad_handles = {}
+    scheduler._param_grad_input_done = False
     return scheduler
+
+
+class TestAllGatherExtension(unittest.TestCase):
+    """Exercise hooks through the native state lifecycle, including duplicate requests."""
+
+    def test_pre_and_post_hooks_wrap_fsdp_restore(self) -> None:
+        """Ordinary, prefetched and fused restores invoke hooks once per cycle."""
+        for fused in (False, True):
+            with self.subTest(fused=fused):
+                events = []
+                parameter = MagicMock()
+                parameter.unshard.side_effect = lambda *_args, **_kwargs: events.append("gather")
+                parameter.wait_for_unshard.side_effect = lambda: events.append("wait")
+                state = object.__new__(HSDPStateV2)
+                state.is_shard, state.all_gather_extension = True, None
+                state.hsdp_params = [parameter]
+                state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=fused)
+                state.param_group = parameter if fused else None
+                scheduler = _make_scheduler_stub()
+                scheduler.hsdp_state = state
+
+                class Extension:
+                    """Inspect parameters after the native wait."""
+
+                    def fsdp_pre_all_gather(self, _current: HSDPStateV2) -> None:
+                        """Observe the actual submission."""
+                        events.append("pre")
+
+                    def fsdp_post_unshard(self, current: HSDPStateV2) -> None:
+                        """Post runs after every managed parameter is logically unsharded."""
+                        self.last_is_shard = current.is_shard
+                        events.append("post")
+
+                extension = Extension()
+                scheduler.register_all_gather_extension(extension)
+                state.prefetch()
+                state.prefetch()
+                self.assertEqual(events, ["pre", "gather"])
+                handle = _UnshardHandle(state)
+                handle.wait()
+                handle.wait()
+                state.wait_for_unshard()
+                self.assertEqual(events, ["pre", "gather", "wait", "post"])
+                self.assertFalse(extension.last_is_shard)
+                state.shard()
+                _UnshardHandle(state).wait()
+                self.assertEqual(events, ["pre", "gather", "wait", "post"])
+                state.unshard()
+                self.assertEqual(events, ["pre", "gather", "wait", "post"] * 2)
+
+    def test_prefetch_completion_orders_wait_and_post_on_the_selected_stream(self) -> None:
+        """FSDP completes AG on S; only replica work runs on the independent W stream."""
+        events, active = [], ["C"]
+        event = MagicMock()
+        event.record.side_effect = lambda stream: events.append(("record", active[0], stream))
+        stream = MagicMock()
+        stream.wait_stream.side_effect = lambda other: events.append(("S_wait", other))
+        compute = MagicMock()
+        compute.wait_event.side_effect = lambda fence: events.append(("C_wait", fence))
+
+        @contextmanager
+        def use_stream(_stream):
+            """Track the host's selected device stream without device initialization."""
+            active[0] = "S"
+            try:
+                yield
+            finally:
+                active[0] = "C"
+
+        device = SimpleNamespace(current_stream=lambda _device: compute if active[0] == "C" else stream,
+                                 stream=use_stream, Event=lambda: event, Stream=lambda **_kwargs: stream)
+        parameter = MagicMock()
+        parameter.wait_for_unshard.side_effect = lambda: events.append(("AG_wait", active[0]))
+        state = object.__new__(HSDPStateV2)
+        state.is_shard, state.device = True, torch.device("cuda")
+        state.hsdp_params = [parameter]
+        state.param_group = None
+        state.scheduler_ctx = HSDPSchedulerContext()
+        state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=False)
+        state.all_gather_extension = SimpleNamespace(
+            fsdp_pre_all_gather=lambda _state: {},
+            fsdp_post_unshard=lambda _state: events.append(("post", active[0])))
+        with patch.object(torch, "get_device_module", return_value=device):
+            state.prefetch()
+            state.complete_prefetch()
+            self.assertEqual(events, [("S_wait", compute), ("AG_wait", "S"), ("post", "S"),
+                                      ("record", "S", stream)])
+            state.complete_prefetch()
+            state.unshard()
+            self.assertEqual(events[-2:], [("C_wait", event), ("post", "C")])
+            state.prefetch()
+            state.complete_prefetch()
+            self.assertEqual(events.count(("post", "S")), 2)
+            self.assertIs(state.scheduler_ctx.all_gather_post_stream, stream)
+            parameter.unshard.assert_called_once_with(True)
+            parameter.wait_for_unshard.assert_called_once_with()
 
 
 def _make_prefetch_param(fqn: str, handle=None) -> HSDPParamV2:
@@ -67,6 +177,7 @@ def _make_prefetch_scheduler(hsdp_params=(), all_gather_buckets=None, scheduler_
         module_name="root",
         is_shard=True,
     )
+    scheduler.scheduler_ctx.last_state = scheduler.hsdp_state
     scheduler._backward_hook = MagicMock()
     scheduler._finalize_comm_fusion_reductions = MagicMock()
     scheduler._finalize_per_param_reductions = MagicMock()
@@ -547,8 +658,8 @@ class TestRootBackwardCallback(unittest.TestCase):
                     param.free_unsharded_param.assert_called_once_with()
                 scheduler._backward_hook.assert_called_once_with()
                 child._backward_hook.assert_called_once_with()
-                scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
-                scheduler._finalize_per_param_reductions.assert_called_once_with()
+                scheduler._finalize_comm_fusion_reductions.assert_called_once_with(scheduler.scheduler_ctx)
+                scheduler._finalize_per_param_reductions.assert_called_once_with(child.hsdp_state)
                 scheduler.launch_tp_replicate_reduce_and_apply.assert_called_once_with()
 
     def test_unused_prefetch_wait_failure_preserves_work(self) -> None:
@@ -616,9 +727,20 @@ class TestRootBackwardCallback(unittest.TestCase):
         self.assertIs(child_param.unsharded_accumulated_grad, accumulated_grad)
         scheduler._backward_hook.assert_called_once_with()
         child._backward_hook.assert_called_once_with()
-        scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
-        scheduler._finalize_per_param_reductions.assert_called_once_with()
+        scheduler._finalize_comm_fusion_reductions.assert_called_once_with(scheduler.scheduler_ctx)
+        scheduler._finalize_per_param_reductions.assert_called_once_with(child.hsdp_state)
         scheduler.launch_tp_replicate_reduce_and_apply.assert_called_once_with()
+
+    def test_root_backward_forces_only_opted_in_param_grad_gate(self) -> None:
+        """仅开启门控的单元需要强制收尾；例如含未使用参数的专家单元不能一直等待。"""
+        scheduler = _make_prefetch_scheduler()
+        child = _make_prefetch_scheduler(scheduler_ctx=scheduler.scheduler_ctx)
+        child._param_grad_gate = True
+
+        scheduler._root_backward_hook()
+
+        scheduler._backward_hook.assert_called_once_with()
+        child._backward_hook.assert_called_once_with(force=True)
 
 
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
@@ -799,7 +921,7 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         hook = HSDPSchedulerV2._forward_pre_hook
 
         self.assertEqual(hook.__name__, "_forward_pre_hook")
-        self.assertEqual(hook.__wrapped__.__name__, "_forward_pre_hook")
+        self.assertEqual(getattr(hook, "__wrapped__").__name__, "_forward_pre_hook")
 
     def test_fsdp_runtime_hooks_are_dynamo_disabled(self):
         """All FSDP runtime scheduler entries should carry the native decorator."""
@@ -892,3 +1014,108 @@ class TestTorchSchedulerSetup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards",
+          essential_mark="essential")
+class TestGradientReductionStream(unittest.TestCase):
+    """Check that owner-gradient completion does not block upstream autograd."""
+
+    def test_background_reduction_joins_only_before_root_gradient_consumption(self) -> None:
+        """G stays on its existing stream; even no-Work outputs are fenced at root."""
+        events = []
+        compute, background = MagicMock(name="compute"), MagicMock(name="background")
+        device_module = MagicMock()
+        active = [compute]
+        device_module.current_stream.side_effect = lambda *_args: active[0]
+        background.wait_stream.side_effect = lambda value: events.append(("background_wait", value))
+        compute.wait_stream.side_effect = lambda value: events.append(("compute_wait", value))
+
+        @contextmanager
+        def use_stream(stream: MagicMock) -> Iterator[None]:
+            """Select a simulated stream without initializing a device."""
+            previous = active[0]
+            active[0] = stream
+            try:
+                yield
+            finally:
+                active[0] = previous
+
+        device_module.stream.side_effect = use_stream
+        device_module.Stream.return_value = background
+        scheduler = _make_scheduler_stub()
+        scheduler.device = torch.device("npu") if hasattr(torch, "npu") else torch.device("cuda")
+        gradient, accumulation, weight = (MagicMock(spec=torch.Tensor) for _ in range(3))
+        parameter = SimpleNamespace(
+            unsharded_grad_data=gradient, unsharded_accumulated_grad_data=accumulation,
+            unsharded_param_buffers=[weight], allgather_comm_ctx=AllGatherCommCtx())
+        state = object.__new__(HSDPStateV2)
+        state.hsdp_params, state.module_name, state.device = [parameter, SimpleNamespace(
+            unsharded_param_buffers=[], allgather_comm_ctx=AllGatherCommCtx())], "expert", scheduler.device
+        state.is_shard = True
+        state.scheduler_ctx = scheduler.scheduler_ctx
+        state.param_group = SimpleNamespace(comm_ctx=None, all_gather_buckets=[])
+        state.post_backward = lambda: events.append(("reduce", active[0]))
+        scheduler.hsdp_state = state
+        scheduler._fsdp_group_post_pending = None
+        state.lazy_init = MagicMock()
+        scheduler._is_root = True
+        scheduler.scheduler_ctx.root_module = object()
+        scheduler.scheduler_ctx.all_hsdp_schedulers = [scheduler]
+        scheduler.register_pre_reduce_hook(lambda _state: events.append(("merge", active[0])))
+        with self.assertRaisesRegex(ValueError, "多个"):
+            scheduler.register_pre_reduce_hook(lambda _state: None)
+        with patch("torch.get_device_module", return_value=device_module):
+            scheduler._lazy_init_all_states()
+            scheduler.scheduler_ctx.lazy_init_done = True
+            scheduler._hsdp_backward_hook(None, None, None)
+            events.append(("upstream_compute", active[0]))
+            self.assertEqual(events, [("background_wait", compute), ("merge", background),
+                                      ("reduce", background), ("upstream_compute", compute)])
+            for tensor in (gradient, accumulation):
+                tensor.record_stream.assert_called_once_with(background)
+            weight.record_stream.assert_not_called()
+            self.assertIsNot(state.reduction_pipeline, scheduler.scheduler_ctx)
+            self.assertIs(state.reduction_pipeline.stream, background)
+            scheduler.scheduler_ctx.all_hsdp_schedulers = [scheduler]
+            scheduler.check_state_prefetch_handles_consumed = MagicMock()
+            scheduler._backward_hook = MagicMock()
+            scheduler._finalize_comm_fusion_reductions = MagicMock()
+            scheduler._finalize_per_param_reductions = MagicMock()
+            scheduler.launch_tp_replicate_reduce_and_apply = lambda: events.append(("apply", active[0]))
+            scheduler._root_backward_hook()
+            self.assertEqual(events[-2:], [("compute_wait", background), ("apply", compute)])
+            self.assertEqual(scheduler._finalize_per_param_reductions.call_args.args, (state,))
+            self.assertEqual(scheduler._finalize_comm_fusion_reductions.call_args.args, (state.reduction_pipeline,))
+            with self.assertRaisesRegex(RuntimeError, "first forward"):
+                scheduler.register_pre_reduce_hook(lambda _state: None)
+            # A later unit uses the same preparation stream and queue.
+            scheduler._hsdp_backward_hook(None, None, None)
+            self.assertEqual(events[-3:], [("background_wait", compute), ("merge", background),
+                                           ("reduce", background)])
+            scheduler._pre_reduce_hook = None
+            scheduler.scheduler_ctx.deferred_pipeline = None
+            scheduler._lazy_init_all_states()
+            self.assertIsNone(state.reduction_pipeline.stream)
+            scheduler._hsdp_backward_hook(None, None, None)
+            self.assertEqual(events[-1], ("reduce", compute))
+
+    def test_ordinary_units_do_not_drain_deferred_no_work_outputs(self) -> None:
+        """EFS=1 outputs remain on their own pipeline until its next unit or root."""
+        context = HSDPSchedulerContext()
+        deferred = HSDPReductionPipeline()
+        state = object.__new__(HSDPStateV2)
+        state.scheduler_ctx = context
+        state.reduction_pipeline = context
+        state.requires_all_reduce = True
+        parameter = SimpleNamespace(reduce_scatter_output=MagicMock(return_value=torch.ones(1)),
+                                    reduce_partial_output=None, unsharded_accumulated_grad_data=None,
+                                    unsharded_param=SimpleNamespace(grad=None))
+        deferred.pre_reduce_scatter_params.append(parameter)
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        parameter.reduce_scatter_output.assert_not_called()
+        self.assertEqual(deferred.pre_reduce_scatter_params, [parameter])
+        state.reduction_pipeline = deferred
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        parameter.reduce_scatter_output.assert_called_once_with()
+        self.assertEqual(deferred.pre_reduce_scatter_params, [])

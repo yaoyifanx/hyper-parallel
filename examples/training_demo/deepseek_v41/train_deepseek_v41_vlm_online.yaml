@@ -163,6 +163,8 @@ plan_overrides:
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
   # Native alternative: remove the MegaMoe expert replacement below and select
   # deepseek_v41_ep_compute_fn with use_grouped_gemm: true.
+  # For MoonEP, use the same alternative with use_moonep: true,
+  # moonep_replica_capacity: null, and moonep_prefetch_depth: 1.
   - match: "model.layers.*.mlp.forward"
     replace:
       kind: method

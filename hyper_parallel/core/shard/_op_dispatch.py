@@ -34,6 +34,7 @@ from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import RaggedShardInfo
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
+from hyper_parallel.core.dtensor.random_init import get_rng_layout
 from hyper_parallel.core.dtensor.debug._dispatch_logger import log_dispatch_enter, log_dispatch_exit
 
 from hyper_parallel.core.tensor_parallel._ce_op_registry import is_loss_parallel_op, is_decomposed_ce_op
@@ -364,7 +365,11 @@ class OpDispatcher:
         local_kwargs = {k: v.to_local() if isinstance(v, DTensor) else v for k, v in kwargs.items()}
         first_local_arg = first_arg.to_local()
 
-        if self._rng_tracker is None and is_rng_supported_mesh(first_arg.device_mesh):
+        rng_layout = get_rng_layout(first_arg)
+        rng_mesh = first_arg.device_mesh if rng_layout is None else rng_layout.device_mesh
+        rng_placements = first_arg.placements if rng_layout is None else rng_layout.placements
+        rng_shape = first_arg.shape if rng_layout is None else rng_layout.global_shape
+        if self._rng_tracker is None and is_rng_supported_mesh(rng_mesh):
             self._rng_tracker = OffsetBasedRNGTracker()
 
         maybe_user_generator = local_kwargs.pop("generator", None)
@@ -375,9 +380,9 @@ class OpDispatcher:
         ):
             # pylint: disable=W0212
             with self._rng_tracker._distribute_region(
-                device_mesh=first_arg.device_mesh,
-                placements=first_arg.placements,
-                global_shape=first_arg.shape,
+                device_mesh=rng_mesh,
+                placements=rng_placements,
+                global_shape=rng_shape,
                 generator=maybe_user_generator,
             ):
                 local_results = op_call(*local_args, **local_kwargs)

@@ -116,7 +116,7 @@ class _UnshardHandle:
     def wait(self):
         """Block until the async unshard operation completes."""
         if self._hsdp_state is not None:
-            self._hsdp_state.wait_for_unshard()
+            self._hsdp_state.complete_unshard()
             self._hsdp_state = None
 
 
