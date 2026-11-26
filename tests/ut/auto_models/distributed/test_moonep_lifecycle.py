@@ -87,7 +87,7 @@ class TestMoonEPLifecycle(unittest.TestCase):
                                     prepare_backward_resources=mock.Mock(),
                                     statistics={"recomputations": 0})
         executor = SimpleNamespace(runtime=lifecycle)
-        tape = moonep_checkpoint._Tape(execution=(executor, key), identity=identity)
+        tape = moonep_checkpoint._Tape(executions=[(executor, key)], identity=identity)
         phase = SimpleNamespace(is_recomputing=True, invocation_id=identity)
         with mock.patch.object(moonep_checkpoint, "get_recompute_state", return_value=phase):
             with moonep_checkpoint._phase(torch.nn.Module(), tape, True):
@@ -95,6 +95,34 @@ class TestMoonEPLifecycle(unittest.TestCase):
                 self.assertIs(moonep_checkpoint.bind_execution(executor, mock.Mock()), key)
         lifecycle.prepare.assert_not_called()
         self.assertEqual(lifecycle.statistics["recomputations"], 1)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_checkpoint_route_order_and_count(self) -> None:
+        """Replay original IDs even if the recomputed scores would select different experts."""
+        router, other = object(), object()
+        probs = torch.tensor([[1., 0.]])
+        flipped = probs.flip(-1)
+        block, tape = torch.nn.Module(), moonep_checkpoint._Tape()
+        phase = SimpleNamespace(is_recomputing=False, invocation_id=object())
+        executor = SimpleNamespace(runtime=SimpleNamespace(statistics={"recomputations": 0}))
+        with mock.patch.object(moonep_checkpoint, "get_recompute_state", return_value=phase):
+            with moonep_checkpoint._phase(block, tape, False):
+                for scores in (probs, flipped):
+                    checkpoint_route_ids(router, scores, 1)
+                moonep_checkpoint.bind_execution(executor, object)
+            phase.is_recomputing = True
+            with self.assertRaisesRegex(RuntimeError, "consume all"):
+                with moonep_checkpoint._phase(block, tape, True):
+                    moonep_checkpoint.bind_execution(executor, object)
+            with self.assertRaisesRegex(RuntimeError, "router order"):
+                with moonep_checkpoint._phase(block, tape, True):
+                    checkpoint_route_ids(other, probs, 1)
+            with moonep_checkpoint._phase(block, tape, True):
+                moonep_checkpoint.bind_execution(executor, object)
+                self.assertEqual(checkpoint_route_ids(router, flipped, 1).item(), 0)
+                self.assertEqual(checkpoint_route_ids(router, probs, 1).item(), 1)
+                with self.assertRaisesRegex(RuntimeError, "extra routing"):
+                    checkpoint_route_ids(router, flipped, 1)
 
     def test_checkpoint_single_execution_error_contract(self) -> None:
         """Keep zero-call forward, one-call replay and all single-record rejection boundaries."""
@@ -107,8 +135,6 @@ class TestMoonEPLifecycle(unittest.TestCase):
         with mock.patch.object(moonep_checkpoint, "get_recompute_state", return_value=state):
             with moonep_checkpoint._phase(block, tape, False):
                 self.assertIs(moonep_checkpoint.bind_execution(executor, factory), key)
-                with self.assertRaisesRegex(ValueError, "仅执行一次"):
-                    moonep_checkpoint.bind_execution(executor, factory)
             factory.assert_called_once_with()
             state.is_recomputing = True
             with moonep_checkpoint._phase(block, tape, True):
@@ -119,22 +145,20 @@ class TestMoonEPLifecycle(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "没有执行"):
                 with moonep_checkpoint._phase(block, tape, True):
                     pass
-            with moonep_checkpoint._phase(block, tape, True):
-                with self.assertRaisesRegex(RuntimeError, "顺序发生变化"):
+            with self.assertRaisesRegex(RuntimeError, "顺序发生变化"):
+                with moonep_checkpoint._phase(block, tape, True):
                     moonep_checkpoint.bind_execution(object(), factory)
-                with self.assertRaisesRegex(RuntimeError, "不存在"):
-                    moonep_checkpoint.bind_execution(executor, factory)
             state.invocation_id = object()
-            with self.assertRaisesRegex(RuntimeError, "原始单专家"):
+            with self.assertRaisesRegex(RuntimeError, "原始专家"):
                 with moonep_checkpoint._phase(block, tape, True):
                     pass
             state.is_recomputing = False
             empty = moonep_checkpoint._Tape()
             with moonep_checkpoint._phase(block, empty, False):
                 pass
-            self.assertIsNone(empty.execution)
+            self.assertEqual(empty.executions, [])
             state.is_recomputing = True
-            with self.assertRaisesRegex(RuntimeError, "原始单专家"):
+            with self.assertRaisesRegex(RuntimeError, "原始专家"):
                 with moonep_checkpoint._phase(block, empty, True):
                     pass
         self.assertIs(moonep_checkpoint._SCOPE.get(), previous)
@@ -161,8 +185,8 @@ class TestMoonEPLifecycle(unittest.TestCase):
                         self.assertIs(moonep_checkpoint._SCOPE.get().tape, outer)
                         state.invocation_id = parent_id
                         moonep_checkpoint.bind_execution(object(), object)
-                self.assertIsNotNone(inner.execution)
-                self.assertIsNotNone(outer.execution)
+                self.assertEqual(len(inner.executions), 1)
+                self.assertEqual(len(outer.executions), 1)
                 self.assertIs(moonep_checkpoint._SCOPE.get(), previous)
 
 
@@ -411,6 +435,28 @@ class TestMoonEPLifecycle(unittest.TestCase):
                         torch.testing.assert_close(value, reference, rtol=1e-6, atol=1e-6)
         # 独立脚本路径只预取紧邻前一专家；较大的旧 depth 值不再预留空槽。
         self._run_model(False, 4)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_whole_region_replays_repeated_expert_and_router(self) -> None:
+        """A shared block called twice must keep both keys, route choices and gradients."""
+        def run(checkpointed):
+            torch.manual_seed(212)
+            first, second = _Block(), _Block()
+            model = torch.nn.Sequential(first, second, first)
+            runtime = configure_moonep(model, prefetch_depth=0)
+            if checkpointed:
+                model = wrap_moonep_checkpoint(model)
+            x = torch.randn(6, 8, requires_grad=True)
+            output = model(x)
+            output.square().sum().backward()
+            runtime.finish_step()
+            self.assertLessEqual(runtime.statistics["max_live_weight_leases"], 2)
+            self.assertFalse(runtime.replay_released)
+            self.assertEqual(runtime.statistics["plans"], 3)
+            return [output.detach(), x.grad, *(param.grad for param in model.parameters())]
+
+        for actual, expected in zip(run(True), run(False)):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_explicit_backward_matches_independent_autograd(self):
         """比较dX、两组dW及前向；例如限幅端点和空专家都经过独立torch公式。"""
