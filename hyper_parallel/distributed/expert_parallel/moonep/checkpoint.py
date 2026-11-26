@@ -27,12 +27,15 @@ from hyper_parallel.core.activation_memory.api import checkpoint_wrapper
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 
 
+SUPPORTS_MULTI_EXPERT_CHECKPOINT = True
+
+
 @dataclass
 class _Tape:
     """一次checkpoint调用的小型记录；例如原F7和R7共享同一K7和router ID。"""
 
-    execution: tuple[Any, Any] | None = None
-    routes: dict = field(default_factory=dict)
+    executions: list[tuple[Any, Any]] = field(default_factory=list)
+    routes: list[tuple[Any, torch.Tensor]] = field(default_factory=list)
     identity: Any = None
 
 
@@ -42,29 +45,36 @@ class _Scope:
 
     tape: _Tape
     replay: bool
-    execution_consumed: bool = False
+    execution_index: int = 0
+    route_index: int = 0
 
 
 _SCOPE: ContextVar[_Scope | None] = ContextVar("moonep_checkpoint_scope", default=None)
 
 
 def bind_execution(executor: Any, create_key: Any) -> Any:
-    """原始前向分配key，重放取回旧key；例如两次layer7调用仍指向同一次原图。"""
+    """Allocate one key per original call and reuse its key at the same replay position."""
     scope = _SCOPE.get()
     if scope is None:
         return create_key()
     if not scope.replay:
-        if scope.tape.execution is not None:
-            raise ValueError("MoonEP重计算键映射要求一个checkpoint区域仅执行一次专家模块")
         key = create_key()
-        scope.tape.execution = executor, key
+        scope.tape.executions.append((executor, key))
         return key
-    if scope.tape.execution is None or scope.execution_consumed:
+    calls = scope.tape.executions
+    index = scope.execution_index
+    if index >= len(calls):
         raise RuntimeError("重放出现原始前向不存在的专家调用")
-    expected, key = scope.tape.execution
-    scope.execution_consumed = True
+    expected, key = calls[index]
     if expected is not executor:
         raise RuntimeError("重计算专家调用顺序发生变化")
+    if index:
+        # The preceding expert has finished reading its replicas. Keeping every
+        # replay lease until backward would exhaust the bounded weight slots.
+        previous, previous_key = calls[index - 1]
+        previous.runtime.release_replay_lease(previous_key)
+    scope.execution_index += 1
+    executor.runtime.statistics["recomputations"] += 1
     return key
 
 
@@ -74,16 +84,29 @@ def is_replaying() -> bool:
     return scope is not None and scope.replay
 
 
+def is_replay_demand(key: Any) -> bool:
+    """Whether the replayed expert has reached its actual parameter restoration hook."""
+    scope = _SCOPE.get()
+    return (scope is not None and scope.replay and scope.execution_index > 0
+            and scope.tape.executions[scope.execution_index - 1][1] is key)
+
+
 def checkpoint_route_ids(router: Any, probabilities: torch.Tensor, top_k: int,
                          *, sorted: bool = True) -> torch.Tensor:
     """只复用离散top-k ID；例如R7仍从新logits可微gather分数以保留router梯度。"""
     scope = _SCOPE.get()
     if scope is not None and scope.replay:
-        return scope.tape.routes[id(router)]
+        if scope.route_index >= len(scope.tape.routes):
+            raise RuntimeError("MoonEP replay produced an extra routing call")
+        expected, ids = scope.tape.routes[scope.route_index]
+        if expected is not router:
+            raise RuntimeError("MoonEP router order changed during replay")
+        scope.route_index += 1
+        return ids
     with torch.no_grad():
         ids = probabilities.topk(top_k, dim=-1, sorted=sorted).indices
     if scope is not None:
-        scope.tape.routes[id(router)] = ids
+        scope.tape.routes.append((router, ids))
     return ids
 
 
@@ -109,8 +132,8 @@ def _phase(block: torch.nn.Module, tape: _Tape, replay: bool) -> Iterator[None]:
     if state is None or state.is_recomputing != replay:
         raise RuntimeError("MoonEP要求Hyper eager非重入checkpoint入口")
     if replay:
-        if tape.identity is not state.invocation_id or tape.execution is None:
-            raise RuntimeError("MoonEP重放必须关联原始单专家区域调用")
+        if tape.identity is not state.invocation_id or not tape.executions:
+            raise RuntimeError("MoonEP重放必须关联原始专家区域调用")
     else:
         tape.identity = state.invocation_id
     scope = _Scope(tape, replay)
@@ -122,14 +145,21 @@ def _phase(block: torch.nn.Module, tape: _Tape, replay: bool) -> Iterator[None]:
                               if getattr(module, "hsdp_scheduler", None) is not None}
                 for scheduler in schedulers.values():
                     stack.enter_context(_suspend_forward_prefetch(scheduler))
-                executor, key = tape.execution
-                prepare_resources = getattr(executor.runtime, "prepare_backward_resources", None)
-                if prepare_resources is not None:
-                    prepare_resources(key)
-                executor.runtime.statistics["recomputations"] += 1
+                # The last original call for a runtime is its first real
+                # backward demand, even though replay runs in forward order.
+                restored = set()
+                for executor, key in reversed(tape.executions):
+                    runtime = executor.runtime
+                    if id(runtime) not in restored:
+                        prepare_resources = getattr(runtime, "prepare_backward_resources", None)
+                        if prepare_resources is not None:
+                            prepare_resources(key)
+                        restored.add(id(runtime))
             yield
-            if replay and not scope.execution_consumed:
-                raise RuntimeError("重放没有执行原始专家调用")
+            if replay and scope.execution_index != len(tape.executions):
+                raise RuntimeError("重放没有执行全部原始专家调用")
+            if replay and scope.route_index != len(tape.routes):
+                raise RuntimeError("MoonEP replay did not consume all original routing calls")
     finally:
         _SCOPE.reset(token)
 
@@ -145,10 +175,10 @@ def checkpoint_context_factory(block: torch.nn.Module) -> Any:
 
 
 def wrap_moonep_checkpoint(block: torch.nn.Module) -> torch.nn.Module:
-    """为单MoE区域安装Hyper非重入重计算，应在FSDP包装前调用。
+    """为MoE区域安装Hyper非重入重计算，应在FSDP包装前调用。
 
     Args:
-        block: 包含一次专家执行的decoder区域，不包含checkpoint参数输入。
+        block: 包含一次或多次专家执行的decoder区域，不包含checkpoint参数输入。
 
     Returns:
         checkpoint包装后的同语义模块；early_stop关闭以保证collective完整重放。

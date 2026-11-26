@@ -57,10 +57,14 @@ class MoonEPAllGatherExtension:
             if key in self.runtime.weight_leases:
                 return
             self.executor.prepare_forward(key, *values)
+        elif (self.runtime.trace and self.runtime.trace[-1] in self.runtime.replay_released
+              and self.runtime.trace[-1].layer == self.executor.layer):
+            # Real backward has restored this expert after its replay lease was released.
+            key = self.runtime.trace[-1]
         else:
             key = self.runtime.prefetch_key(self.executor)
         if (key is None or key in self.runtime.weight_leases
-                or key in self.runtime.pending_weight_preparations):
+                or (pending is None and key in self.runtime.pending_weight_preparations)):
             return
         self.runtime.prepare_restored_weights(key)
         statistic = "fsdp_ep_demand_preparations" if pending is not None else "fsdp_ep_prefetches"

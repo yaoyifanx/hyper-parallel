@@ -187,7 +187,7 @@ class TestSparseAdmission(unittest.TestCase):
         self.runtime.arena = arena
         expert = self.executors[0]
         key = self.runtime.new_key(expert)
-        scope = SimpleNamespace(replay=True, execution_consumed=False, tape=SimpleNamespace(execution=(expert, key)))
+        scope = SimpleNamespace(replay=True, execution_index=0, tape=SimpleNamespace(executions=[(expert, key)]))
         factory = Mock(side_effect=lambda: self.runtime.new_key(expert))
         with patch.object(checkpoint, "_SCOPE", SimpleNamespace(get=lambda: scope)):
             replay_key = checkpoint.bind_execution(expert, factory)

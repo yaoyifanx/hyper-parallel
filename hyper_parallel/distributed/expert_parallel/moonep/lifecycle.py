@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import torch
 
-from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import bind_execution
+from hyper_parallel.distributed.expert_parallel.moonep.checkpoint import bind_execution, is_replay_demand
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,7 @@ class MoonEPLifecycle(ABC):
         self.weight_leases: dict[ExecutionKey, Any] = {}
         self.forward_inputs: dict[int, tuple[ExecutionKey, tuple]] = {}
         self.fsdp_layers: set[int] = set()
+        self.replay_released: set[ExecutionKey] = set()
         self.pending_weight_preparations: dict[ExecutionKey, Any] = {}
         self.backward_weight_ready: Optional[tuple[ExecutionKey, Any]] = None
         self.statistics = Counter()
@@ -70,6 +71,11 @@ class MoonEPLifecycle(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def release(self, key: ExecutionKey) -> None:
+        """Return this backend's consumed weight lease after its final reader."""
+        raise NotImplementedError
+
     @staticmethod
     def _record_weight_dependency(device: torch.device) -> Any:
         """Capture existing device work without synchronizing the host."""
@@ -81,7 +87,7 @@ class MoonEPLifecycle(ABC):
         return event
 
     def prepare_restored_weights(self, key: ExecutionKey) -> None:
-        """Remember restored homes and prepare only the next execution.
+        """Prepare a current replay demand or queue a home for ordered backward prefetch.
 
         Args:
             key: Original or replayed invocation restored by the existing FSDP hook.
@@ -94,17 +100,18 @@ class MoonEPLifecycle(ABC):
             return
         if key.version != self.version or key not in self.executions or key not in self.trace:
             raise RuntimeError("restored MoonEP weights require a live execution at the current version")
-        if key not in self.pending_weight_preparations:
+        demand = is_replay_demand(key)
+        if demand or key not in self.pending_weight_preparations:
             executor, _ = self.executions[key]
             device = executor.read_weights()[0].device
             self.pending_weight_preparations[key] = self._record_weight_dependency(device)
-        self._prepare_next_weights()
+        self._prepare_next_weights(key if demand else None)
 
-    def _prepare_next_weights(self) -> None:
+    def _prepare_next_weights(self, replay_key: Optional[ExecutionKey] = None) -> None:
         """Submit at a deterministic hook or EP exit, never by event polling."""
         if not self.trace:
             return
-        key = self.trace[-1]
+        key = self.trace[-1] if replay_key is None else replay_key
         if key not in self.pending_weight_preparations or key in self.weight_leases:
             return
         events = [self.pending_weight_preparations[key]]
@@ -142,6 +149,12 @@ class MoonEPLifecycle(ABC):
             self.backward_weight_ready = self.trace[-1], self._record_weight_dependency(device)
             self._prepare_next_weights()
 
+    def release_replay_lease(self, key: ExecutionKey) -> None:
+        """Return an intermediate replay lease after the expert's final forward reader."""
+        self.release(key)
+        if key.layer in self.fsdp_layers:
+            self.replay_released.add(key)
+
     def new_key(self, executor: Any) -> ExecutionKey:
         """Allocate an original invocation; checkpoint replay reuses this key.
 
@@ -168,6 +181,7 @@ class MoonEPLifecycle(ABC):
         if not self.trace or self.trace[-1] != key:
             raise RuntimeError("MoonEP backward completion must follow reverse original-forward order")
         self.trace.pop()
+        self.replay_released.discard(key)
         return self.executions.pop(key)
 
     def forward_key(self, executor: Any, hidden: Any, ids: Any, scores: Any,

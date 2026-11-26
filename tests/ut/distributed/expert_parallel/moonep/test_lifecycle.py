@@ -59,6 +59,10 @@ class _RecordedLifecycle(MoonEPLifecycle):
         self.weight_leases[key] = object()
         return self.weight_leases[key]
 
+    def release(self, key: ExecutionKey) -> None:
+        """Return a recorded, previously prepared lease."""
+        del self.weight_leases[key]
+
     def retire_backward(self, key: ExecutionKey) -> None:
         """Model release and completion before an expert exit.
 
@@ -72,6 +76,34 @@ class _RecordedLifecycle(MoonEPLifecycle):
 
 class TestRestoredWeightOrder(unittest.TestCase):
     """Exercise early, late, absent and deep prefetch notifications."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_replay_uses_current_home_fence_and_preserves_reverse_order(self) -> None:
+        """Feature: Multi-expert replay.
+
+        Description: Recompute the first expert while true backward still points at the second.
+        Expectation: Use the newest home fence and restore released weights for true backward.
+        """
+        runtime = _RecordedLifecycle(2)
+        first, last = runtime.keys
+        with patch.object(runtime, "_record_weight_dependency",
+                          side_effect=["prefetch", "replay_home", "last_home", "ep_exit", "backward_home"]):
+            runtime.prepare_restored_weights(first)
+            with patch("hyper_parallel.distributed.expert_parallel.moonep.lifecycle.is_replay_demand",
+                       side_effect=lambda key: key is first):
+                runtime.prepare_restored_weights(first)
+            self.assertEqual(runtime.submissions, [(first, ("replay_home",))])
+            self.assertEqual(runtime.trace, [first, last])
+            runtime.release_replay_lease(first)
+            runtime.prepare_restored_weights(last)
+            runtime.retire_backward(last)
+            # A shared executor can be ambiguous to a speculative prefetch.
+            runtime.prefetch_key = lambda executor: None
+            MoonEPAllGatherExtension(runtime.executors[0], runtime).fsdp_post_unshard(None)
+            self.assertEqual(runtime.submissions[-1], (first, ("backward_home", "ep_exit")))
+            runtime.retire_backward(first)
+        self.assertFalse(runtime.replay_released)
+        self.assertFalse(runtime.pending_weight_preparations)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_early_home_is_deferred_until_current_ep_exit(self) -> None:
